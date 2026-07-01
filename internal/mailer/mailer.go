@@ -14,17 +14,17 @@ var (
 	ToHeader        = "To: "
 	SubjectHeader   = "Subject: "
 	MessageIDHeader = "Message-ID: "
-	MimeHeader      = "MIME-version: 1.0;" + StdNewline +"Content-Type: text/plain; charset=\"UTF-8\";"
+	MimeHeader      = "MIME-version: 1.0;" + StdNewline + "Content-Type: text/plain; charset=\"UTF-8\";"
 )
 
-type MailConfig struct {
+type mailConfig struct {
 	Hostname string
 	Port     string
 	Key      string
 	Sender   string
 }
 
-type MailContent struct {
+type mailContent struct {
 	From      string
 	To        []string
 	Subject   string
@@ -32,31 +32,47 @@ type MailContent struct {
 	MessageID string
 }
 
-func (c *MailConfig) Send(m *MailContent) error {
+type Envelope struct {
+	MailToSend   mailContent
+	ClientConfig mailConfig
+}
+
+func (e *Envelope) Send() error {
+
+	mailClient := e.ClientConfig
+
+	mailSender := mailClient.Sender
+	mailKey := mailClient.Key
+	mailHostname := mailClient.Hostname
+	mailPort := mailClient.Port
 
 	auth := smtp.PlainAuth(
 		"",
-		c.Sender,
-		c.Key,
-		c.Hostname,
+		mailSender,
+		mailKey,
+		mailHostname,
 	)
 
-	messageID, err := GenerateMessageID(c.Hostname)
+	messageID, err := GenerateMessageID(mailHostname)
 
 	if err != nil {
 		return err
 	}
 
-	m.MessageID = messageID
+	mailContent := e.MailToSend
 
-	mailMsg := m.ToBytes()
-	addr := c.Hostname + ":" + c.Port
+	mailContent.MessageID = messageID
+	mailFrom := mailContent.From
+	mailTo := mailContent.To
+	mailMsg := mailContent.ToBytes()
 
-	return smtp.SendMail(addr, auth, m.From, m.To, mailMsg)
+	addr := mailHostname + ":" + mailPort
+
+	return smtp.SendMail(addr, auth, mailFrom, mailTo, mailMsg)
 
 }
 
-func (m *MailContent) ToBytes() []byte {
+func (m *mailContent) ToBytes() []byte {
 	var stringbuilder strings.Builder
 
 	stringbuilder.WriteString(FromHeader)
@@ -97,6 +113,7 @@ func GenerateMessageID(domain string) (string, error) {
 	// UUID compliance
 	// clear top 4 bits and set version
 	uuid[6] = (uuid[6] & 0x0f) | 0x40
+
 	// clear top 2
 	uuid[8] = (uuid[8] & 0x3f) | 0x80
 
