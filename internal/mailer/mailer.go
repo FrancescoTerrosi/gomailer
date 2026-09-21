@@ -1,125 +1,129 @@
 package mailer
 
 import (
-	"crypto/rand"
+	"crypto/tls"
 	"fmt"
-	"log"
+	"net"
 	"net/smtp"
-	"strings"
 )
 
-var (
-	StdNewline      = "\r\n"
-	FromHeader      = "From: "
-	ToHeader        = "To: "
-	SubjectHeader   = "Subject: "
-	MessageIDHeader = "Message-ID: "
-	MimeHeader      = "MIME-version: 1.0;" + StdNewline + "Content-Type: text/plain; charset=\"UTF-8\";"
-)
-
-type mailConfig struct {
+// MailConfig holds the connection and authentication parameters of the
+// sender's PEC mailbox.
+type MailConfig struct {
+	// Hostname is the PEC provider SMTP host, e.g. "smtp.pec.example.it".
 	Hostname string
-	Port     string
-	Key      string
-	Sender   string
+	// Port is "465" for implicit TLS (SMTPS) or "587" for STARTTLS.
+	Port string
+	// Username is the certified PEC mailbox address. It is used both as the
+	// SMTP authentication identity and as the envelope sender (MAIL FROM).
+	Username string
+	// Password is the mailbox password (or app-specific password).
+	Password string
+	// InsecureSkipVerify disables TLS certificate verification. It is intended
+	// for local/testing only and MUST NOT be enabled in production, where PEC
+	// requires a fully verified TLS channel.
+	InsecureSkipVerify bool
 }
 
-type mailContent struct {
-	From      string
-	To        []string
-	Subject   string
-	Body      string
-	MessageID string
-}
+// Send builds a PEC-compliant message and delivers it over TLS to the
+// configured PEC provider.
+func (c MailConfig) Send(content *MailContent) error {
+	if content == nil {
+		return fmt.Errorf("mailer: nil content")
+	}
 
-type Envelope struct {
-	MailToSend   mailContent
-	ClientConfig mailConfig
-}
+	// The certified identity is the mailbox itself: the From header and the
+	// envelope sender must both be the authenticated PEC address.
+	if content.From == "" {
+		content.From = c.Username
+	}
+	if content.From != c.Username {
+		return fmt.Errorf("mailer: From %q must equal the certified PEC address %q", content.From, c.Username)
+	}
 
-func (e *Envelope) Send() error {
+	if content.MessageID == "" {
+		id, err := GenerateMessageID(domainOf(c.Username))
+		if err != nil {
+			return fmt.Errorf("mailer: generating message-id: %w", err)
+		}
+		content.MessageID = id
+	}
 
-	mailClient := e.ClientConfig
-
-	mailSender := mailClient.Sender
-	mailKey := mailClient.Key
-	mailHostname := mailClient.Hostname
-	mailPort := mailClient.Port
-
-	auth := smtp.PlainAuth(
-		"",
-		mailSender,
-		mailKey,
-		mailHostname,
-	)
-
-	messageID, err := GenerateMessageID(mailHostname)
-
+	msg, err := content.build(c.Username, content.MessageID)
 	if err != nil {
 		return err
 	}
 
-	mailContent := e.MailToSend
-
-	mailContent.MessageID = messageID
-	mailFrom := mailContent.From
-	mailTo := mailContent.To
-	mailMsg := mailContent.ToBytes()
-
-	addr := mailHostname + ":" + mailPort
-
-	return smtp.SendMail(addr, auth, mailFrom, mailTo, mailMsg)
-
+	return c.deliver(c.Username, content.To, msg)
 }
 
-func (m *mailContent) ToBytes() []byte {
-	var stringbuilder strings.Builder
+// deliver establishes a TLS-protected SMTP session (implicit TLS on port 465,
+// STARTTLS otherwise), authenticates, and transfers the message. PEC mandates
+// an encrypted transport; no plaintext SMTP is ever used.
+func (c MailConfig) deliver(from string, to []string, msg []byte) error {
+	addr := net.JoinHostPort(c.Hostname, c.Port)
 
-	stringbuilder.WriteString(FromHeader)
-	stringbuilder.WriteString(m.From)
-	stringbuilder.WriteString(StdNewline)
+	var (
+		client *smtp.Client
+		err    error
+	)
 
-	stringbuilder.WriteString(ToHeader)
-	stringbuilder.WriteString(strings.Join(m.To, ","))
-	stringbuilder.WriteString(StdNewline)
-
-	stringbuilder.WriteString(SubjectHeader)
-	stringbuilder.WriteString(m.Subject)
-	stringbuilder.WriteString(StdNewline)
-
-	stringbuilder.WriteString(MessageIDHeader)
-	stringbuilder.WriteString(m.MessageID)
-	stringbuilder.WriteString(StdNewline)
-
-	stringbuilder.WriteString(MimeHeader)
-	stringbuilder.WriteString(StdNewline)
-	stringbuilder.WriteString(StdNewline)
-
-	stringbuilder.WriteString(m.Body)
-
-	return []byte(stringbuilder.String())
-
-}
-
-func GenerateMessageID(domain string) (string, error) {
-	uuid := make([]byte, 16)
-
-	_, err := rand.Read(uuid)
-
+	if c.Port == "465" {
+		// Implicit TLS (SMTPS).
+		conn, derr := tls.Dial("tcp", addr, c.tlsConfig())
+		if derr != nil {
+			return fmt.Errorf("mailer: tls dial: %w", derr)
+		}
+		client, err = smtp.NewClient(conn, c.Hostname)
+	} else {
+		// Plain connection, then upgrade with STARTTLS.
+		conn, derr := net.Dial("tcp", addr)
+		if derr != nil {
+			return fmt.Errorf("mailer: dial: %w", derr)
+		}
+		client, err = smtp.NewClient(conn, c.Hostname)
+		if err == nil {
+			err = client.StartTLS(c.tlsConfig())
+		}
+	}
 	if err != nil {
-		return "", err
+		return fmt.Errorf("mailer: smtp session: %w", err)
+	}
+	defer client.Close()
+
+	auth := smtp.PlainAuth("", c.Username, c.Password, c.Hostname)
+	if err := client.Auth(auth); err != nil {
+		return fmt.Errorf("mailer: auth: %w", err)
 	}
 
-	// UUID compliance
-	// clear top 4 bits and set version
-	uuid[6] = (uuid[6] & 0x0f) | 0x40
+	// Envelope sender is the certified address.
+	if err := client.Mail(from); err != nil {
+		return fmt.Errorf("mailer: mail from: %w", err)
+	}
+	for _, rcpt := range to {
+		if err := client.Rcpt(rcpt); err != nil {
+			return fmt.Errorf("mailer: rcpt to %q: %w", rcpt, err)
+		}
+	}
 
-	// clear top 2
-	uuid[8] = (uuid[8] & 0x3f) | 0x80
+	w, err := client.Data()
+	if err != nil {
+		return fmt.Errorf("mailer: data: %w", err)
+	}
+	if _, err := w.Write(msg); err != nil {
+		return fmt.Errorf("mailer: write message: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("mailer: close message: %w", err)
+	}
 
-	uuidStr := fmt.Sprintf("%x-%x-%x-%x-%x", uuid[0:4], uuid[4:6], uuid[6:8], uuid[8:10], uuid[10:16])
-	log.Printf("SUCCESFULLY GENERATED UUID: %s", uuidStr)
+	return client.Quit()
+}
 
-	return fmt.Sprintf("<%s@%s>", uuidStr, domain), nil
-
+func (c MailConfig) tlsConfig() *tls.Config {
+	return &tls.Config{
+		ServerName:         c.Hostname,
+		InsecureSkipVerify: c.InsecureSkipVerify,
+		MinVersion:         tls.VersionTLS12,
+	}
 }
