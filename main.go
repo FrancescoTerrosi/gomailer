@@ -1,36 +1,36 @@
 package main
 
 import (
-	"fmt"
-	"gomailer/internal/mailer"
 	"log"
-	"net/smtp"
+
+	"gomailer/internal/mailer"
 )
 
 func main() {
-
-	emailConfig := mailer.MailConfig{
-		Hostname: "hostname",
-		Port:     "587",
-		Key:      "myKey",
-		Sender:   "sender",
+	cfg := mailer.MailConfig{
+		Hostname: "sendm.cert.legalmail.it",
+		Port:     "465",                     // implicit TLS (SMTPS)
+		Username: "massmailer@legalmail.it", // certified PEC mailbox
+		Password: "mySecretPassword123",
 	}
 
-	emailContent := &mailer.MailContent{
-		From:    "senderNick",
-		To:      []string{"recipient1, recipient2"},
-		Subject: "Test",
-		Body:    "Hello world! I'm working!",
+	content := &mailer.MailContent{
+		From:         "massmailer@legalmail.it", // MUST equal Username
+		To:           []string{"receiver@pect.it"},
+		Subject:      "Oggetto della PEC",
+		Body:         "Corpo del messaggio certificato.",
+		TipoRicevuta: mailer.RicevutaCompleta,
+
+		// Attachments: the message becomes multipart/mixed, with the text
+		// body first and each attachment base64-encoded after it.
+		Attachments: []mailer.Attachment{
+			mailer.NewAttachment("contratto.pdf", []byte("%PDF-1.4 ...")),
+		},
 	}
 
-	err := emailConfig.Send(emailContent)
-
-	if err != nil {
-		err = fmt.Errorf("> COULD NOT SEND EMAIL\n %w", err)
-		log.Fatal(err)
+	if err := cfg.Send(content); err != nil {
+		log.Fatalf("> COULD NOT SEND EMAIL: %v", err)
 	}
 
 	log.Println("> EMAIL SENT!")
-
 }
-

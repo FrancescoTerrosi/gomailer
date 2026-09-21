@@ -16,7 +16,7 @@ func (s *Scheduler) ExecuteBatch() {
 			time.Sleep(job.FireAt.Sub(now))
 		}
 
-		job.Content.Send()
+		job.Config.Send(&job.Content)
 	}
 
 	s.CurrentBatch = nil
