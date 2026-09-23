@@ -1,0 +1,28 @@
+# gomailer systemd unit — automatic resume after reboot/crash.
+#
+# Install:
+#   sudo install -m755 gomailer /usr/local/bin/gomailer
+#   sudo mkdir -p /var/lib/gomailer
+#   sudo install -m600 /dev/null /etc/gomailer.env   # then add PEC_PASSWORD=...
+#   sudo systemctl enable --now gomailer
+#
+# Resume mode: no scheduling flags, so the binary loads the store and
+# fires whatever is pending. A reboot BEFORE a job's FireAt costs nothing:
+# the job re-arms from the store and still fires exactly on time. Only a
+# machine down AT the fire time triggers catch-up (logged as
+# "FIRED <delay> LATE"). The process exits when the queue is empty;
+# Restart=on-failure keeps it alive after crashes.
+
+[Unit]
+Description=gomailer — PEC scheduled sender
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/gomailer -store /var/lib/gomailer/jobs.json
+EnvironmentFile=/etc/gomailer.env
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -89,8 +89,8 @@ Receipt kinds emitted downstream (for reference, via `X-Ricevuta`):
 
 | Requirement | Implementation |
 |-------------|----------------|
-| 1. TLS only | `mailer.go` → `deliver` (implicit TLS on `465`, `STARTTLS` otherwise), `tlsConfig` enforces TLS 1.2 + verification |
-| 2. Certified identity | `mailer.go` → `Send` rejects `From != Username`; envelope sender = `Username` |
+| 1. TLS only | `mailer.go` → `connect`/`SendOn` (implicit TLS on `465`, `STARTTLS` otherwise), `tlsConfig` enforces TLS 1.2 + verification |
+| 2. Certified identity | `mailer.go` → `Prepare` (used by `Send`) rejects `From != Username`; envelope sender = `Username` |
 | 3. Mandatory headers | `pec.go` (constants) + `message.go` → `build` emits `X-Trasporto`, `X-TipoRicevuta`, and `X-Riferimento-Message-ID` when set |
 | 4. Receipts | `pec.go` → `TipoRicevuta` (`completa`/`breve`/`sintetica`); provider-generated receipts are out of scope |
 | 5. MIME structure | `message.go` → `build` (single-part vs `multipart/mixed`) |
