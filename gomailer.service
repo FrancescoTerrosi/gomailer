@@ -1,4 +1,4 @@
-# gomailer systemd unit — automatic resume after reboot/crash.
+# gomailer systemd unit — THE daemon: the single process that fires jobs.
 #
 # Install:
 #   sudo install -m755 gomailer /usr/local/bin/gomailer
@@ -6,20 +6,25 @@
 #   sudo install -m600 /dev/null /etc/gomailer.env   # then add PEC_PASSWORD=...
 #   sudo systemctl enable --now gomailer
 #
-# Resume mode: no scheduling flags, so the binary loads the store and
-# fires whatever is pending. A reboot BEFORE a job's FireAt costs nothing:
-# the job re-arms from the store and still fires exactly on time. Only a
-# machine down AT the fire time triggers catch-up (logged as
-# "FIRED <delay> LATE"). The process exits when the queue is empty;
-# Restart=on-failure keeps it alive after crashes.
+# The daemon loads the store at boot and re-arms every pending job: a reboot
+# BEFORE a job's FireAt costs nothing (it still fires exactly on time); only
+# a machine down AT the fire time triggers catch-up, logged "FIRED <delay>
+# LATE". Scheduling clients (gomailer -at/-in ...) submit to the daemon
+# over its control socket and never send anything themselves, so there is
+# exactly one sending process — a second daemon on the same store is refused
+# by the run lock, as is a manual resume while the daemon owns the store.
+#
+# Stopping is graceful: jobs already inside their warmup window or mid-send
+# run to completion (bounded by -lead, default 5s); jobs still waiting stay
+# pending in the store and re-arm at the next start.
 
 [Unit]
-Description=gomailer — PEC scheduled sender
+Description=gomailer — PEC scheduling daemon
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/gomailer -store /var/lib/gomailer/jobs.json
+ExecStart=/usr/local/bin/gomailer -daemon -store /var/lib/gomailer/jobs.json
 EnvironmentFile=/etc/gomailer.env
 Restart=on-failure
 RestartSec=2

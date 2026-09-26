@@ -74,8 +74,8 @@ func (c *MailContent) build(from, messageID string) ([]byte, error) {
 	}
 
 	line("From: %s", formatAddress(from))
-	line("To: %s", strings.Join(mapStrings(c.To, formatAddress), ", "))
-	line("Subject: %s", encodeHeaderWord(c.Subject))
+	line("To: %s", foldAddressList(mapStrings(c.To, formatAddress)))
+	line("Subject: %s", renderSubject(c.Subject))
 	line("Date: %s", time.Now().Format(time.RFC1123Z))
 	line("Message-ID: %s", messageID)
 	line("MIME-Version: 1.0")
@@ -139,11 +139,123 @@ func (c *MailContent) tipoRicevuta() TipoRicevuta {
 	return c.TipoRicevuta
 }
 
-// randomBoundary returns a unique MIME multipart boundary string.
-func randomBoundary() string {
-	var raw [16]byte
-	_, _ = rand.Read(raw[:])
-	return fmt.Sprintf("pec_%x", raw[:])
+// smtpLineLimit is the maximum line length, excluding CRLF, that RFC 5321
+// §4.5.3.1.6 obliges every SMTP receiver to accept. Staying inside it (and
+// inside RFC 2045's 76-character base64 lines) keeps long text and large
+// attachments from being a delivery risk on a strict MTA — a PEC provider
+// rejecting the busta over line length would be a silent, late failure.
+const smtpLineLimit = 998
+
+// headerWidth is the per-line budget for folded headers: comfortably inside
+// smtpLineLimit with room for the "Subject: " prefix and continuation spaces.
+const headerWidth = 900
+
+// renderSubject renders the Subject value, folding anything that would
+// overflow the SMTP line limit. Folding an unstructured header at
+// whitespace is lossless: unfolding removes only the CRLF, so a compliant
+// reader sees the identical value. Values that cannot fold at whitespace
+// (one huge token, or non-ASCII long enough that its encoded form
+// overflows) are emitted as several RFC 2047 B-words joined by folds —
+// adjacent encoded words concatenate on decoding, so that is lossless too.
+func renderSubject(subj string) string {
+	subj = stripNewlines(subj)
+	if v := encodeHeaderWord(subj); len(v) <= headerWidth && !strings.ContainsAny(v, "\r\n") {
+		return v
+	}
+	if isASCII(subj) && longestToken(subj) <= headerWidth {
+		return foldAtSpaces(subj)
+	}
+	return foldBWords(subj)
+}
+
+// foldAddressList joins and folds an address list at its ", " separators,
+// so a long recipient list cannot overflow the line limit. The fold sits
+// between addresses, where RFC 5322 allows FWS: unfolding restores the
+// identical list.
+func foldAddressList(addrs []string) string {
+	var b strings.Builder
+	n := 0
+	for i, a := range addrs {
+		if i > 0 {
+			b.WriteString(",")
+			if n+len(a)+2 > headerWidth {
+				b.WriteString("\r\n ") // fold between addresses
+				n = 1
+			} else {
+				b.WriteString(" ")
+				n++
+			}
+		}
+		b.WriteString(a)
+		n += len(a)
+	}
+	return b.String()
+}
+
+// longestToken returns the longest space-free run in s.
+func longestToken(s string) int {
+	longest, n := 0, 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == ' ' || s[i] == '\t' {
+			n = 0
+		} else {
+			n++
+			if n > longest {
+				longest = n
+			}
+		}
+	}
+	return longest
+}
+
+// foldAtSpaces folds s at its spaces so no line exceeds headerWidth. Each
+// fold replaces a space with CRLF+space — unfolding restores the exact
+// original byte for byte.
+func foldAtSpaces(s string) string {
+	var b strings.Builder
+	n := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == ' ' && n >= headerWidth {
+			b.WriteString("\r\n ")
+			n = 1
+			continue
+		}
+		b.WriteByte(s[i])
+		n++
+	}
+	return b.String()
+}
+
+// foldBWords encodes s as a run of small RFC 2047 B-words separated by
+// folds. Adjacent encoded words are concatenated (the separating
+// whitespace dropped) on decoding, so the decoded value is exact. The
+// words are built directly rather than through mime.BEncoding, which
+// passes pure-ASCII text through unencoded — this path exists exactly
+// for tokens that cannot be folded any other way.
+func foldBWords(s string) string {
+	var words []string
+	for start := 0; start < len(s); {
+		end := start + 24
+		if end > len(s) {
+			end = len(s)
+		} else if end < len(s) {
+			for end > start+1 && s[end]&0xC0 == 0x80 {
+				end-- // keep UTF-8 runes whole
+			}
+		}
+		words = append(words, "=?UTF-8?B?"+base64.StdEncoding.EncodeToString([]byte(s[start:end]))+"?=")
+		start = end
+	}
+	return strings.Join(words, "\r\n ")
+}
+
+// stripNewlines removes CR and LF from a header value: embedded line
+// breaks would split (and so forge) headers.
+func stripNewlines(s string) string {
+	if !strings.ContainsAny(s, "\r\n") {
+		return s
+	}
+	return strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ").Replace(s)
 }
 
 // GenerateMessageID builds an RFC 5322 Message-ID using a random UUIDv4 and
@@ -176,10 +288,13 @@ func domainOf(addr string) string {
 // formatAddress renders a mailbox address for use in a header. When a display
 // name is present it is RFC 2047 encoded, otherwise the bare address is used
 // (which is the strict requirement for the certified identity in a PEC).
+// Values that fail address parsing are passed through with any CR/LF
+// stripped — they will be rejected by the provider, but must never be able
+// to forge headers.
 func formatAddress(addr string) string {
 	a, err := mail.ParseAddress(addr)
 	if err != nil || a.Address == "" {
-		return addr
+		return stripNewlines(addr)
 	}
 	if a.Name == "" {
 		return a.Address
@@ -207,19 +322,62 @@ func encodeFilename(name string) string {
 }
 
 // encodeText returns a Content-Transfer-Encoding and the encoded text body.
-// ASCII bodies stay 7-bit; anything else is base64 encoded (and line wrapped).
+// ASCII bodies whose lines fit the SMTP limit stay 7-bit (bare LF/CR line
+// endings are normalized to the CRLF RFC 5322 mandates on the wire);
+// anything else — non-ASCII, or one line longer than a receiver must
+// accept — is base64 encoded byte-exact, in RFC 2045 76-character lines.
 func encodeText(body string) (string, string) {
-	if isASCII(body) {
-		return "7bit", body
+	text := normalizeCRLF(body)
+	if isASCII(text) && maxLineLen(text) <= smtpLineLimit {
+		return "7bit", text
 	}
-	return "base64", b64([]byte(body))
+	return "base64", b64([]byte(text))
 }
 
+// normalizeCRLF rewrites bare LF and bare CR line endings into the CRLF
+// that RFC 5322 mandates. Already-CRLF text is untouched.
+func normalizeCRLF(s string) string {
+	if !strings.ContainsAny(s, "\r\n") {
+		return s
+	}
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return strings.ReplaceAll(s, "\n", StdNewline)
+}
+
+// maxLineLen returns the longest line length, excluding CRLF.
+func maxLineLen(s string) int {
+	longest, n := 0, 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\r':
+		case '\n':
+			if n > longest {
+				longest = n
+			}
+			n = 0
+		default:
+			n++
+		}
+	}
+	if n > longest {
+		longest = n
+	}
+	return longest
+}
+
+// b64 encodes data as RFC 2045 base64 wrapped at 76 characters per line
+// with CRLF: an unwrapped encoder emits one line of unbounded length, which
+// RFC 2045 forbids and strict SMTP receivers may reject.
 func b64(data []byte) string {
+	enc := base64.StdEncoding.EncodeToString(data)
 	var b strings.Builder
-	enc := base64.NewEncoder(base64.StdEncoding, &b)
-	_, _ = enc.Write(data)
-	_ = enc.Close()
+	for len(enc) > 76 {
+		b.WriteString(enc[:76])
+		b.WriteString(StdNewline)
+		enc = enc[76:]
+	}
+	b.WriteString(enc)
 	return b.String()
 }
 
@@ -230,6 +388,13 @@ func isASCII(s string) bool {
 		}
 	}
 	return true
+}
+
+// randomBoundary returns a unique MIME multipart boundary string.
+func randomBoundary() string {
+	var raw [16]byte
+	_, _ = rand.Read(raw[:])
+	return fmt.Sprintf("pec_%x", raw[:])
 }
 
 func mapStrings(in []string, f func(string) string) []string {

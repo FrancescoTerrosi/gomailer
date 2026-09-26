@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"syscall"
 )
 
 // storeVersion is the on-disk schema version, leaving room for migrations
@@ -76,11 +77,17 @@ func (s *Store) loadLocked() ([]Job, error) {
 	return sf.Jobs, nil
 }
 
-// Add appends a new job. The whole read-modify-write is serialized under
-// the store mutex, so concurrent Adds cannot lose jobs.
+// Add appends a new job. The whole read-modify-write runs under the
+// in-process mutex AND a cross-process flock (see lock), so concurrent
+// Adds — from this process or another — cannot lose jobs.
 func (s *Store) Add(j Job) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lk, err := s.lock()
+	if err != nil {
+		return err
+	}
+	defer unlockStore(lk)
 	jobs, err := s.loadLocked()
 	if err != nil {
 		return err
@@ -92,6 +99,11 @@ func (s *Store) Add(j Job) error {
 func (s *Store) Update(j Job) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lk, err := s.lock()
+	if err != nil {
+		return err
+	}
+	defer unlockStore(lk)
 	jobs, err := s.loadLocked()
 	if err != nil {
 		return err
@@ -103,6 +115,79 @@ func (s *Store) Update(j Job) error {
 		}
 	}
 	return s.saveLocked(append(jobs, j))
+}
+
+// GetByID returns the job with the given ID, if present.
+func (s *Store) GetByID(id string) (Job, bool, error) {
+	jobs, err := s.Load()
+	if err != nil {
+		return Job{}, false, err
+	}
+	for _, j := range jobs {
+		if j.ID == id {
+			return j, true, nil
+		}
+	}
+	return Job{}, false, nil
+}
+
+// AddNew atomically persists j unless a job with the same ID already exists
+// — the idempotency seam behind safe submission retries. It returns
+// (existing, false, nil) when the ID is taken (a concurrent twin or a
+// replay) and (j, true, nil) when j was created. The existence check and
+// the append are ONE read-modify-write under the in-process mutex and the
+// cross-process mutation lock, so two processes racing the same ID still
+// end up with exactly one copy.
+func (s *Store) AddNew(j Job) (Job, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lk, err := s.lock()
+	if err != nil {
+		return Job{}, false, err
+	}
+	defer unlockStore(lk)
+	jobs, err := s.loadLocked()
+	if err != nil {
+		return Job{}, false, err
+	}
+	for i := range jobs {
+		if jobs[i].ID == j.ID {
+			return jobs[i], false, nil
+		}
+	}
+	if err := s.saveLocked(append(jobs, j)); err != nil {
+		return Job{}, false, err
+	}
+	return j, true, nil
+}
+
+// lock takes the cross-process mutation lock on <store>.lock for the
+// span of one read-modify-write. The daemon is the writer in the common
+// case, but scheduling clients also persist directly when the daemon is
+// unreachable (persist-only fallback), and a lost update would mean a
+// scheduled certified job silently vanishing — so writers serialize.
+// Readers never lock: the atomic rename below already guarantees they
+// observe either the old or the new file, never a torn one. Advisory
+// flock — the deployment target is Linux/systemd.
+func (s *Store) lock() (*os.File, error) {
+	f, err := os.OpenFile(s.path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("jobber: opening lock file for %s: %w", s.path, err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("jobber: locking store %s: %w", s.path, err)
+	}
+	return f, nil
+}
+
+// unlockStore releases the mutation lock (nil-safe).
+func unlockStore(f *os.File) {
+	if f == nil {
+		return
+	}
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = f.Close()
 }
 
 // saveLocked atomically persists the full job set. Completed jobs are

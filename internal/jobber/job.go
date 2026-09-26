@@ -58,8 +58,11 @@ type Job struct {
 	Result    *JobResult
 }
 
-// newJobID returns a short random hex identifier.
-func newJobID() (string, error) {
+// NewJobID returns a short random hex identifier. Clients pre-generate it
+// before submitting so the submission can be retried idempotently (see
+// Scheduler.ScheduleWithID): a lost acknowledgment must never be able to
+// turn into a second, duplicate certified send.
+func NewJobID() (string, error) {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err
