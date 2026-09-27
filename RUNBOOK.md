@@ -26,6 +26,7 @@ Message-IDs will differ; the shapes are exactly what you will see.
     go build -o gomailer .
     sudo install -m755 gomailer /usr/local/bin/gomailer
     sudo install -m644 gomailer.service /etc/systemd/system/gomailer.service
+    sudo install -d -m755 /etc/sysusers.d            # not shipped by Ubuntu/Debian
     sudo install -m644 gomailer.sysusers.conf /etc/sysusers.d/gomailer.conf
     sudo systemd-sysusers                # creates the gomailer user/group
     sudo systemctl daemon-reload
@@ -33,7 +34,10 @@ Message-IDs will differ; the shapes are exactly what you will see.
 
 `systemd-sysusers` reads [gomailer.sysusers.conf](gomailer.sysusers.conf) and
 creates the dedicated `gomailer` system account; it is idempotent, so
-re-running the install is safe. The service runs as that user, and systemd's
+re-running the install is safe. (Ubuntu/Debian do not ship `/etc/sysusers.d`
+— hence the `install -d` line; `/usr/lib/sysusers.d/gomailer.conf` works
+equally, both are in systemd-sysusers' search path, and `/etc` takes
+precedence.) The service runs as that user, and systemd's
 `StateDirectory=` creates `/var/lib/gomailer` (0700) owned by it — no manual
 `mkdir`/`chown`, and the store never runs as root. The unit also sandboxes
 the daemon: read-only filesystem except the state dir, a `@system-service`
