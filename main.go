@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -48,10 +49,11 @@ func main() {
 		pass      = flag.String("pass", os.Getenv("PEC_PASSWORD"), "mailbox password (falls back to $PEC_PASSWORD)")
 		storePath = flag.String("store", "gomailer-jobs.json", "job store (JSON file; survives reboot)")
 
-		at      = flag.String("at", "", `absolute fire time: "2006-01-02 15:04:05", "15:04:05" (today, local), or RFC3339`)
-		in      = flag.String("in", "", `relative fire time: "90s", "5m", "1h30m" (ignored when -at is set)`)
-		minLead = flag.Duration("min-lead", 0, "minimum scheduling horizon; the future 24/7 service will set 24h")
-		lead    = flag.Duration("lead", 5*time.Second, "warmup lead: session+auth open this long before the fire time; 0 = cold (daemon and resume modes)")
+		at         = flag.String("at", "", `absolute fire time: "2006-01-02 15:04:05", "15:04:05" (today, local), or RFC3339`)
+		in         = flag.String("in", "", `relative fire time: "90s", "5m", "1h30m" (ignored when -at is set)`)
+		minLead    = flag.Duration("min-lead", 0, "minimum scheduling horizon; the future 24/7 service will set 24h")
+		lead       = flag.Duration("lead", 5*time.Second, "warmup lead: session+auth open this long before the fire time; 0 = cold (daemon and resume modes)")
+		maxPayload = flag.Int("max-payload", 70, "per-job payload limit in MB, decimal (body + attachments; the default mirrors the default provider's guaranteed 70 MB attachment bound; 0 disables the check)")
 
 		to      = flag.String("to", "", "comma-separated recipient PEC addresses")
 		subject = flag.String("subject", "", "message subject")
@@ -63,6 +65,11 @@ func main() {
 		sock       = flag.String("sock", "", `control socket: the daemon listens here, clients submit here (default: gomailer.sock next to -store)`)
 		ping       = flag.Bool("ping", false, "health check: report the daemon's protocol version and pending job count; exits 1 if the daemon is unreachable")
 	)
+	// -attach is repeatable: one occurrence per file
+	// (-attach contratto.pdf -attach appendice.txt). The stdlib flag
+	// package has no repeatable string flag, hence flag.Var.
+	var attach attachList
+	flag.Var(&attach, "attach", "file to attach (repeatable): read once at scheduling time, delivered as a PEC attachment")
 	flag.Parse()
 
 	sockPath := *sock
@@ -85,6 +92,14 @@ func main() {
 	scheduler := jobber.NewScheduler(store)
 	scheduler.MinLead = *minLead
 	scheduler.WarmLead = *lead
+	// Scheduling policy, like MinLead: applies wherever scheduling
+	// happens — daemon socket and client fallback alike. The default
+	// mirrors the provider's guaranteed bound; 0 (or negative) disables.
+	if mb := *maxPayload; mb > 0 {
+		scheduler.MaxPayload = int64(mb) * 1000 * 1000
+	} else {
+		scheduler.MaxPayload = 0
+	}
 
 	if *list {
 		jobs, err := store.Load()
@@ -141,6 +156,14 @@ func main() {
 		Body:         *body,
 		TipoRicevuta: mailer.RicevutaCompleta,
 	}
+	// Attachments are read ONCE, here, at scheduling time (see
+	// loadAttachments): an unreadable file is a scheduling-time error,
+	// never a fire-time surprise.
+	atts, err := loadAttachments(attach)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	content.Attachments = atts
 	submitJob(sockPath, scheduler, cfg, &content, fireAt)
 }
 
@@ -280,13 +303,17 @@ func runPing(sock string) error {
 }
 
 // parseFireTime resolves the -at/-in flags to an absolute time.Time.
+// -at wins over -in (exactly as the -in flag help and the runbook
+// promise): when both are given the absolute form is authoritative and
+// the relative one is ignored — an invalid -at is an error even when a
+// valid -in sits beside it, never a silent fallback.
 // The short clock-time form "15:04:05" means today at that local clock
 // time, rolling to tomorrow when already past.
 func parseFireTime(at, in string) (time.Time, error) {
 	if at == "" && in == "" {
 		return time.Time{}, fmt.Errorf("no fire time given: use -at or -in")
 	}
-	if in != "" {
+	if at == "" {
 		d, err := time.ParseDuration(in)
 		if err != nil {
 			return time.Time{}, fmt.Errorf("invalid -in %q: %w", in, err)
@@ -328,6 +355,47 @@ func splitAddresses(s string) []string {
 		}
 	}
 	return out
+}
+
+// attachList is a repeatable string flag: each -attach occurrence appends
+// one file path (the stdlib flag package has no repeatable string flag,
+// hence this flag.Value implementation).
+type attachList []string
+
+func (a *attachList) String() string { return strings.Join(*a, ",") }
+
+func (a *attachList) Set(v string) error {
+	*a = append(*a, v)
+	return nil
+}
+
+// loadAttachments reads every -attach file into a mailer.Attachment, with
+// the recipient-visible filename taken from the file's base name (a full
+// path would leak the sender's directory layout) and the Content-Type
+// inferred from the extension (application/octet-stream when unknown).
+//
+// Files are read ONCE, here, at scheduling time on the client side: the
+// daemon only ever replays the persisted bytes, so a file edited after
+// scheduling cannot silently alter a message that is legally binding the
+// moment it fires. A missing or unreadable file is therefore a
+// scheduling-time error — never a fire-time surprise.
+//
+// NOTE (deferred, see TODO.md): attachment bytes are embedded base64 in
+// the store JSON, and the filename is the one input not bounded for the
+// SMTP line limit at scheduling time.
+func loadAttachments(paths []string) ([]mailer.Attachment, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	atts := make([]mailer.Attachment, 0, len(paths))
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil, fmt.Errorf("reading attachment %s: %w", p, err)
+		}
+		atts = append(atts, mailer.NewAttachment(filepath.Base(p), data))
+	}
+	return atts, nil
 }
 
 // printJobs dumps the store as a human-readable table (verification aid).

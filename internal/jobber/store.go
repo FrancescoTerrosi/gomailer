@@ -27,9 +27,12 @@ type storeFile struct {
 // entry is fsynced too), so a reboot mid-write can never expose a torn
 // file: a reader sees either the old or the new state, never a half one.
 //
-// SECURITY: Job carries the mailbox credentials, so the file is created
-// with 0600 permissions. Do not loosen this; the future service should
-// move credentials out of the job record entirely (vault/env).
+// SECURITY: pending jobs carry the mailbox credentials (replayed at fire
+// time), so the file is created with 0600 permissions — do not loosen
+// this. Terminal rows are stripped of their credential (see Update): a
+// job that will never fire again has no business remembering one. The
+// future service should move credentials out of the job record
+// entirely (vault/env, or at-rest encryption — see TODO.md).
 type Store struct {
 	path string
 	mu   sync.Mutex
@@ -97,6 +100,17 @@ func (s *Store) Add(j Job) error {
 
 // Update replaces the job with the same ID, or appends it when absent.
 func (s *Store) Update(j Job) error {
+	// A terminal job never fires again (never auto-resent; a re-send is
+	// a NEW job with fresh credentials), so its mailbox credential is
+	// dead weight and pure risk: strip it before the row is persisted.
+	// Every terminal-state write in the system flows through this one
+	// choke point, which makes the invariant mechanical rather than
+	// conventional — a future code path cannot forget it. Pending and
+	// inflight rows keep theirs: the firing loop replays them at fire
+	// time.
+	if j.State == StateSent || j.State == StateFailed {
+		j.Config.Password = ""
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	lk, err := s.lock()
@@ -159,6 +173,40 @@ func (s *Store) AddNew(j Job) (Job, bool, error) {
 		return Job{}, false, err
 	}
 	return j, true, nil
+}
+
+// BlankTerminalPasswords blanks the credential of every TERMINAL job
+// still carrying one — rows persisted by an older gomailer, before the
+// strip-on-terminal invariant landed in Update — and persists the
+// store in ONE atomic rewrite. It returns how many rows were swept;
+// zero means nothing was written. Pending and inflight rows are
+// untouched: their credential is replayed at fire time.
+func (s *Store) BlankTerminalPasswords() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lk, err := s.lock()
+	if err != nil {
+		return 0, err
+	}
+	defer unlockStore(lk)
+	jobs, err := s.loadLocked()
+	if err != nil {
+		return 0, err
+	}
+	swept := 0
+	for i := range jobs {
+		if (jobs[i].State == StateSent || jobs[i].State == StateFailed) && jobs[i].Config.Password != "" {
+			jobs[i].Config.Password = ""
+			swept++
+		}
+	}
+	if swept == 0 {
+		return 0, nil
+	}
+	if err := s.saveLocked(jobs); err != nil {
+		return 0, err
+	}
+	return swept, nil
 }
 
 // lock takes the cross-process mutation lock on <store>.lock for the

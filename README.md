@@ -41,12 +41,16 @@ instead of conventional:
     ./gomailer -daemon                          # foreground; systemd in production
     ./gomailer -daemon -store /var/lib/gomailer/jobs.json
 
-Install [gomailer.service](gomailer.service) (systemd): it runs the
-daemon, reads `PEC_PASSWORD` from `/etc/gomailer.env`, restarts it after
-crashes and starts it at boot. Stopping is graceful: jobs already inside
-their warmup window or mid-send run to completion (bounded by `-lead`);
-everything still waiting stays pending in the store and re-arms at the
-next start.
+Install [gomailer.service](gomailer.service) and
+[gomailer.sysusers.conf](gomailer.sysusers.conf) (systemd):
+`systemd-sysusers` creates the dedicated `gomailer` account the daemon runs
+as, the unit restarts it after crashes and starts it at boot. The daemon
+itself carries no credentials — jobs do — so the unit needs no
+`PEC_PASSWORD`; scheduling clients run as the same `gomailer` user because
+the store and socket are owner-only (see [RUNBOOK.md](RUNBOOK.md) §2).
+Stopping is graceful: jobs already inside their warmup window or mid-send
+run to completion (bounded by `-lead`); everything still waiting stays
+pending in the store and re-arms at the next start.
 
 Health check from anywhere:
 
@@ -57,6 +61,7 @@ Health check from anywhere:
 
     ./gomailer -at "15:00:00" -to dest@pec.it -subject test -body "hello"
     ./gomailer -in 2m    -to dest@pec.it -subject test -body "hello"
+    ./gomailer -in 2m    -to dest@pec.it -subject test -body "hello" -attach contratto.pdf   # repeatable
 
 The client resolves the fire time, submits to the daemon and prints the
 acknowledgment — the job is **persisted by the daemon before it is
@@ -130,7 +135,8 @@ NTP-synced (`timedatectl`) for meaningful numbers.
 ## The store
 
 A single human-readable JSON file (default `gomailer-jobs.json`), mode
-0600 — it contains the mailbox credentials, so keep it private. Every
+0600 — it contains the mailbox credentials of the jobs still waiting to
+fire (terminal rows are stripped of theirs), so keep it private. Every
 state transition rewrites it atomically (temp file → fsync → rename), and
 completed jobs are kept as history:
 
@@ -145,8 +151,12 @@ daemon-unreachable fallback — safely, under the mutation lock.
 The future 24/7 service will require jobs to be scheduled at least 24h in
 advance: that is already enforced by `-min-lead 24h` (rejected at
 scheduling time, so a job with a deadline already in the past cannot exist
-by construction). `-min-lead` and `-lead` are daemon-side policies; they
-apply wherever the firing happens.
+by construction). `-min-lead`, `-lead` and `-max-payload` are daemon-side
+policies; they apply wherever the firing happens. `-max-payload`
+(default 70 MB, `0` disables) mirrors the default provider's guaranteed
+attachment bound, so a message the provider will not carry is rejected
+at scheduling time, not failed at fire time; recipient lists are capped
+at 1000 per send for the same reason.
 
 ## Socket protocol (local automation)
 

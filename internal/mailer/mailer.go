@@ -54,7 +54,7 @@ func (c MailConfig) Prepare(content *MailContent) ([]byte, error) {
 		return nil, fmt.Errorf("mailer: From %q must equal the certified PEC address %q", content.From, c.Username)
 	}
 	if content.MessageID == "" {
-		id, err := GenerateMessageID(domainOf(c.Username))
+		id, err := GenerateMessageID(DomainOf(c.Username))
 		if err != nil {
 			return nil, fmt.Errorf("mailer: generating message-id: %w", err)
 		}

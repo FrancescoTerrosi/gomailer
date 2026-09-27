@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -131,6 +132,233 @@ func TestMinLead(t *testing.T) {
 	c := testContent("hi")
 	if _, err := s.Schedule(testConfig(), &c, time.Now().Add(time.Hour)); err == nil {
 		t.Fatal("job scheduled within MinLead")
+	}
+}
+
+// TestPayloadQuota: the per-job payload admission — over-quota dies at
+// scheduling time with the limit named and nothing persisted; the
+// boundary is inclusive; 0 disables the check; and a replay of an
+// already-persisted job converges even when the quota would now reject
+// it (idempotency outranks admission control).
+func TestPayloadQuota(t *testing.T) {
+	store := testStore(t)
+	s := NewScheduler(store)
+	if s.MaxPayload != defaultMaxPayload {
+		t.Fatalf("default quota = %d, want the provider-mirrored %d", s.MaxPayload, defaultMaxPayload)
+	}
+	s.MaxPayload = 1000
+
+	big := testContent("hi")
+	big.Attachments = []mailer.Attachment{{Filename: "big.bin", ContentType: "application/octet-stream", Data: make([]byte, 2000)}}
+	if _, err := s.ScheduleWithID("quota-over", testConfig(), &big, time.Now().Add(time.Hour)); err == nil {
+		t.Fatal("over-quota payload accepted")
+	} else if !strings.Contains(err.Error(), "payload") || !strings.Contains(err.Error(), humanBytes(1000)) {
+		t.Fatalf("error must name the payload and the limit: %v", err)
+	}
+	if jobs, _ := store.Load(); len(jobs) != 0 {
+		t.Fatalf("over-quota submission persisted %d row(s)", len(jobs))
+	}
+
+	// Exactly at the boundary: accepted (the rejection is strictly above).
+	edge := testContent("hi") // body: 2 bytes
+	edge.Attachments = []mailer.Attachment{{Filename: "edge.bin", ContentType: "application/octet-stream", Data: make([]byte, 998)}}
+	if _, err := s.ScheduleWithID("quota-edge", testConfig(), &edge, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("at-the-boundary payload rejected: %v", err)
+	}
+
+	// Disabled: no check at all.
+	s.MaxPayload = 0
+	if _, err := s.ScheduleWithID("quota-off", testConfig(), &big, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("quota disabled but the big payload was rejected: %v", err)
+	}
+
+	// Idempotency outranks admission: re-enabling the quota must not
+	// break the replay of the job persisted while it was off.
+	s.MaxPayload = 1000
+	again, err := s.ScheduleWithID("quota-off", testConfig(), &big, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("replay of a now-over-quota job must converge: %v", err)
+	}
+	if again.ID != "quota-off" || again.State != StatePending {
+		t.Fatalf("replay = %+v; want the existing pending job returned as-is", again)
+	}
+	if jobs, _ := store.Load(); len(jobs) != 2 {
+		t.Fatalf("store rows = %d, want 2 (the over-quota attempt was never persisted)", len(jobs))
+	}
+}
+
+// TestUpdateStripsTerminalCredentials: a row that will never fire again
+// carries no credential — Update is the single choke point every state
+// write flows through, so the strip is mechanical. It must NOT fire
+// early: pending and inflight rows keep theirs, the firing loop
+// replays them at fire time.
+func TestUpdateStripsTerminalCredentials(t *testing.T) {
+	store := testStore(t)
+	base := Job{
+		ID:        "strip",
+		MessageID: "<strip@pec.test>",
+		FireAt:    time.Now().Add(time.Hour),
+		CreatedAt: time.Now(),
+		Content:   testContent("x"),
+		Config:    testConfig(), // carries Password "secret"
+	}
+	for _, st := range []JobState{StatePending, StateInflight} {
+		j := base
+		j.State = st
+		if err := store.Update(j); err != nil {
+			t.Fatalf("Update(%s): %v", st, err)
+		}
+		if got, ok, _ := store.GetByID("strip"); !ok || got.Config.Password != "secret" {
+			t.Fatalf("%s row lost its credential — fire time still needs it", st)
+		}
+	}
+	for _, st := range []JobState{StateSent, StateFailed} {
+		j := base
+		j.State = st
+		if err := store.Update(j); err != nil {
+			t.Fatalf("Update(%s): %v", st, err)
+		}
+		if got, ok, _ := store.GetByID("strip"); !ok || got.Config.Password != "" {
+			t.Fatalf("%s row still carries its credential — it will never fire again", st)
+		}
+	}
+}
+
+// TestFiredJobLandsCredentialless: end to end — a job that fired leaves
+// a sent row with no credential behind.
+func TestFiredJobLandsCredentialless(t *testing.T) {
+	store := testStore(t)
+	s := NewScheduler(store)
+	coldCourier(s)
+	content := testContent("bye bye credential")
+	if _, err := s.ScheduleWithID("e2e-strip", testConfig(), &content, time.Now().Add(100*time.Millisecond)); err != nil {
+		t.Fatalf("schedule: %v", err)
+	}
+	if err := s.Run(); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	jobs, _ := store.Load()
+	if len(jobs) != 1 || jobs[0].State != StateSent {
+		t.Fatalf("state = %q, want sent", jobs[0].State)
+	}
+	if jobs[0].Config.Password != "" {
+		t.Fatal("the sent row still carries the mailbox password")
+	}
+}
+
+// TestFailedBeforeSendAlsoStripped: a job that never reached the wire
+// (prepare failed) is failed-and-credentialless too — never auto-resent,
+// so the credential is dead weight there as well.
+func TestFailedBeforeSendAlsoStripped(t *testing.T) {
+	store := testStore(t)
+	s := NewScheduler(store)
+	s.WarmLead = 0
+	s.Courier = &fakeCourier{prepareErr: errors.New("broken build")}
+	content := testContent("never sent")
+	if _, err := s.ScheduleWithID("fail-strip", testConfig(), &content, time.Now().Add(100*time.Millisecond)); err != nil {
+		t.Fatalf("schedule: %v", err)
+	}
+	if err := s.Run(); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	jobs, _ := store.Load()
+	if jobs[0].State != StateFailed || jobs[0].Config.Password != "" {
+		t.Fatalf("failed row: state=%q pass=%q", jobs[0].State, jobs[0].Config.Password)
+	}
+}
+
+// TestBlankTerminalPasswordsSweep: rows written by an older gomailer
+// (terminal, still credentialed) are swept in ONE atomic rewrite;
+// pending rows keep their live credential; a second sweep rewrites
+// nothing.
+func TestBlankTerminalPasswordsSweep(t *testing.T) {
+	store := testStore(t)
+	old := Job{
+		ID:        "old-sent",
+		MessageID: "<old-sent@pec.test>",
+		FireAt:    time.Now().Add(-time.Hour),
+		CreatedAt: time.Now().Add(-2 * time.Hour),
+		Content:   testContent("old"),
+		Config:    testConfig(),
+		State:     StateSent,
+		Result:    &JobResult{FiredAt: time.Now().Add(-time.Hour)},
+	}
+	older := old
+	older.ID, older.MessageID = "old-failed", "<old-failed@pec.test>"
+	older.State = StateFailed
+	older.Result = &JobResult{FiredAt: time.Now().Add(-time.Hour), Err: "x"}
+	pending := Job{
+		ID:        "live",
+		MessageID: "<live@pec.test>",
+		FireAt:    time.Now().Add(time.Hour),
+		CreatedAt: time.Now(),
+		Content:   testContent("live"),
+		Config:    testConfig(),
+		State:     StatePending,
+	}
+	for _, j := range []Job{old, older, pending} {
+		if err := store.Add(j); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+
+	swept, err := store.BlankTerminalPasswords()
+	if err != nil || swept != 2 {
+		t.Fatalf("sweep = %d, err = %v; want 2, nil", swept, err)
+	}
+	jobs, _ := store.Load()
+	for _, j := range jobs {
+		want := ""
+		if j.ID == "live" {
+			want = "secret" // pending: the credential is replayed at fire time
+		}
+		if j.Config.Password != want {
+			t.Fatalf("job %s password = %q, want %q", j.ID, j.Config.Password, want)
+		}
+	}
+
+	// Idempotent: nothing left to sweep, nothing rewritten.
+	before, err := os.Stat(store.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if swept, err := store.BlankTerminalPasswords(); err != nil || swept != 0 {
+		t.Fatalf("second sweep = %d, err = %v; want 0, nil", swept, err)
+	}
+	after, err := os.Stat(store.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatal("an empty sweep rewrote the store")
+	}
+}
+
+// TestBootSweepsOldTerminalCredentials: the firing process sweeps stale
+// credentials at boot (before the queue starts or the socket accepts).
+func TestBootSweepsOldTerminalCredentials(t *testing.T) {
+	store := testStore(t)
+	if err := store.Add(Job{
+		ID:        "stale",
+		MessageID: "<stale@pec.test>",
+		FireAt:    time.Now().Add(-time.Hour),
+		CreatedAt: time.Now().Add(-2 * time.Hour),
+		Content:   testContent("stale"),
+		Config:    testConfig(),
+		State:     StateSent,
+		Result:    &JobResult{FiredAt: time.Now().Add(-time.Hour)},
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	s := NewScheduler(store)
+	coldCourier(s)
+	if err := s.Run(); err != nil { // empty queue: load, sweep, done
+		t.Fatalf("run: %v", err)
+	}
+	jobs, _ := store.Load()
+	if len(jobs) != 1 || jobs[0].Config.Password != "" {
+		t.Fatalf("boot must sweep the stale credential: state=%q pass=%q", jobs[0].State, jobs[0].Config.Password)
 	}
 }
 
@@ -530,5 +758,127 @@ func TestWarmSessionSurvivesRequeue(t *testing.T) {
 	}
 	if lateness := c.sends[1].at.Sub(fireA); lateness < 0 || lateness > 500*time.Millisecond {
 		t.Fatalf("A lateness = %v, want 0..500ms", lateness)
+	}
+}
+
+// countWarmSends returns how many sends went over a warm (non-nil) session.
+func countWarmSends(sends []sendCall) int {
+	n := 0
+	for _, s := range sends {
+		if s.session != nil {
+			n++
+		}
+	}
+	return n
+}
+
+// TestSameDeadlineAllWarm: jobs that share a deadline must EACH get their
+// warm session, not just the one that happened to be head when the window
+// opened. Under the old strict "warm only if still before the window"
+// rule the loop dispatched the first job at T-WarmLead and then judged
+// every follower — evaluated a microsecond later — as already past the
+// window, firing it cold at FireAt. Eager dispatch hands off every job
+// whose window is open with the full lead still ahead of it.
+func TestSameDeadlineAllWarm(t *testing.T) {
+	store := testStore(t)
+	s := NewScheduler(store)
+	s.WarmLead = 2 * time.Second
+	c := &fakeCourier{}
+	s.Courier = c
+
+	fireAt := time.Now().Add(3 * time.Second)
+	for i := 0; i < 3; i++ {
+		content := testContent("same")
+		if _, err := s.Schedule(testConfig(), &content, fireAt); err != nil {
+			t.Fatalf("Schedule %d: %v", i, err)
+		}
+	}
+	if err := s.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.sends) != 3 || len(c.warms) != 3 {
+		t.Fatalf("sends=%d warms=%d, want 3 and 3 (every same-deadline job warms)", len(c.sends), len(c.warms))
+	}
+	if got := countWarmSends(c.sends); got != 3 {
+		t.Fatalf("warm sends = %d, want 3 (followers must not fall to the cold path)", got)
+	}
+}
+
+// TestLateScheduledStaysCold: eager dispatch must NOT warm a job that was
+// scheduled inside its warm window with too little time left to finish
+// warmup before the deadline — it fires cold, exactly as before.
+func TestLateScheduledStaysCold(t *testing.T) {
+	store := testStore(t)
+	s := NewScheduler(store)
+	s.WarmLead = 2 * time.Second
+	c := &fakeCourier{}
+	s.Courier = c
+
+	// 500ms from now: inside the 2s window, below the 1s warm budget.
+	content := testContent("late")
+	if _, err := s.Schedule(testConfig(), &content, time.Now().Add(800*time.Millisecond)); err != nil {
+		t.Fatalf("Schedule: %v", err)
+	}
+	if err := s.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.sends) != 1 {
+		t.Fatalf("sends = %d, want 1", len(c.sends))
+	}
+	if c.sends[0].session != nil || len(c.warms) != 0 {
+		t.Fatalf("late-scheduled job warmed (warms=%d): too little time remained", len(c.warms))
+	}
+}
+
+// TestColdJobDoesNotShadowFollowers: a cold job must not drag later jobs
+// whose warm windows opened before its FireAt down with it. Under the old
+// rule the loop parked on the cold job until its FireAt, so every follower
+// evaluated then was already inside its own window and also fired cold.
+func TestColdJobDoesNotShadowFollowers(t *testing.T) {
+	store := testStore(t)
+	s := NewScheduler(store)
+	s.WarmLead = 2 * time.Second
+	c := &fakeCourier{}
+	s.Courier = c
+
+	// A: 500ms out, inside its window and below the warm budget -> cold.
+	// B and C are far enough out that, once A is dispatched, they are
+	// still evaluated before their windows open -> they must warm.
+	ca := testContent("A")
+	if _, err := s.Schedule(testConfig(), &ca, time.Now().Add(800*time.Millisecond)); err != nil {
+		t.Fatalf("Schedule A: %v", err)
+	}
+	cb := testContent("B")
+	if _, err := s.Schedule(testConfig(), &cb, time.Now().Add(2500*time.Millisecond)); err != nil {
+		t.Fatalf("Schedule B: %v", err)
+	}
+	cc := testContent("C")
+	if _, err := s.Schedule(testConfig(), &cc, time.Now().Add(4500*time.Millisecond)); err != nil {
+		t.Fatalf("Schedule C: %v", err)
+	}
+	if err := s.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.sends) != 3 || len(c.warms) != 2 {
+		t.Fatalf("sends=%d warms=%d, want 3 sends and 2 warm (B and C; A cold)", len(c.sends), len(c.warms))
+	}
+	// A fires first (cold); B and C follow over warm sessions.
+	if string(c.sends[0].msg) != "A" || c.sends[0].session != nil {
+		t.Fatalf("A must fire first, cold: msg=%q session=%v", c.sends[0].msg, c.sends[0].session)
+	}
+	if _, ok := c.sends[1].session.(*warmToken); !ok || string(c.sends[1].msg) != "B" {
+		t.Fatalf("B must fire warm after A: msg=%q session=%v", c.sends[1].msg, c.sends[1].session)
+	}
+	if _, ok := c.sends[2].session.(*warmToken); !ok || string(c.sends[2].msg) != "C" {
+		t.Fatalf("C must fire warm: msg=%q session=%v", c.sends[2].msg, c.sends[2].session)
 	}
 }

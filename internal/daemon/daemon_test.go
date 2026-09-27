@@ -76,6 +76,7 @@ func startDaemon(t *testing.T) (*jobber.Store, *fakeCourier, string, context.Can
 	}
 	s := jobber.NewScheduler(store)
 	s.WarmLead = 0
+	s.MaxPayload = 4096 // small for tests; production defaults to the provider-mirrored 70 MB
 	c := &fakeCourier{}
 	s.Courier = c
 
@@ -199,6 +200,33 @@ func TestDaemonRejectsInvalidJob(t *testing.T) {
 	}
 	if !strings.Contains(resp.Error, "body") {
 		t.Fatalf("error = %q, want it to mention the body", resp.Error)
+	}
+	jobs, err := store.Load()
+	if err != nil || len(jobs) != 0 {
+		t.Fatalf("store: err=%v jobs=%d, want nothing persisted", err, len(jobs))
+	}
+}
+
+// TestDaemonRejectsOversizedPayload: the payload quota is daemon-side
+// policy — an over-quota socket submission is refused at the door with
+// the limit named, nothing persisted.
+func TestDaemonRejectsOversizedPayload(t *testing.T) {
+	store, _, sock, _ := startDaemon(t)
+
+	big := testContent("over the test quota")
+	big.Attachments = []mailer.Attachment{{Filename: "big.bin", ContentType: "application/octet-stream", Data: make([]byte, 8192)}}
+	resp, err := Submit(sock, Request{
+		Op: OpSchedule, FireAt: time.Now().Add(time.Hour),
+		Config: testConfig(), Content: big,
+	})
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if resp.OK {
+		t.Fatal("over-quota submission accepted over the socket")
+	}
+	if !strings.Contains(resp.Error, "payload") {
+		t.Fatalf("error = %q, want it to name the payload limit", resp.Error)
 	}
 	jobs, err := store.Load()
 	if err != nil || len(jobs) != 0 {

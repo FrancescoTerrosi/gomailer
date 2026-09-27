@@ -74,6 +74,36 @@ const maxArm = time.Second
 // idle-timeout so the warm session is still alive at FireAt.
 const defaultWarmLead = 5 * time.Second
 
+// minWarmBudget is the least time-to-fire at which an eagerly dispatched
+// job still attempts warmup — the boundary between "dispatched at the
+// window opening" (warm) and "scheduled inside the window, or catching
+// up" (cold). It is ~3x the measured connect+auth cost against the real
+// provider (~100-300ms), so a warmup that starts with this much time
+// left comfortably finishes before the deadline. Capped at WarmLead/2 so
+// a deliberately short -lead still warms the jobs dispatched at its own
+// window opening.
+const minWarmBudget = time.Second
+
+// defaultMaxPayload is the per-job payload admission default (body +
+// attachment bytes). It mirrors the default provider's published
+// guarantee — Legalmail certifies delivery only for messages whose
+// attachments total up to 70 MB (Manuale Operativo §5.1; max message
+// 100 MB) — so a message the provider will not carry dies at
+// scheduling time, never at fire time. Decimal MB, like the provider's
+// own number; `-max-payload 0` disables the check. The RAM window this
+// leaves is bounded: ~2.4x the payload at fire time (decoded job +
+// built multipart, base64 ≈ 1.37x), ~16x measured end-to-end with the
+// JSON store's rewrite buffers.
+const defaultMaxPayload int64 = 70 * 1000 * 1000
+
+// maxRecipients caps the recipient list per job: the default provider
+// refuses more than 1000 recipients between To and Cc, and every
+// ricevuta echoes the full original message back into the sender's
+// mailbox — a list past the cap is a guaranteed fire-time refusal (and
+// a mailbox-filling hazard for the sender's own receipts), so it dies
+// at scheduling time.
+const maxRecipients = 1000
+
 // errJobTerminal signals that a job reached a terminal state during
 // warmup (e.g. prepare failed): it must NOT be re-queued.
 var errJobTerminal = errors.New("jobber: job reached a terminal state during warmup")
@@ -124,9 +154,10 @@ type warmState struct {
 // "inflight" marker is persisted and an authenticated provider session is
 // opened, so at FireAt only the envelope/data round-trips remain.
 // Warmup is best-effort: any failure degrades to a cold send at FireAt
-// and never costs the job its deadline. Jobs handed off with less than
-// WarmLead remaining (scheduled late, catch-up, or the loop was busy
-// with earlier jobs) fire cold.
+// and never costs the job its deadline. Every job is handed off as its
+// warm window opens; one that reaches the loop with too little time left
+// to finish warmup (scheduled inside the window, or catching up) fires
+// cold — see minWarmBudget.
 type Scheduler struct {
 	store *Store
 
@@ -139,9 +170,19 @@ type Scheduler struct {
 	// 24/7 service sets this to 24h; the CLI test tool defaults to 0.
 	MinLead time.Duration
 
-	// WarmLead is how far before FireAt the warmup phase starts. Jobs
-	// with less than WarmLead remaining fire cold. Zero disables warmup.
+	// WarmLead is how far before FireAt the warmup phase starts. Every job
+	// is dispatched as its window opens; a dispatch with at least
+	// min(minWarmBudget, WarmLead/2) left to FireAt warms, one with less
+	// fires cold. Zero disables warmup.
 	WarmLead time.Duration
+
+	// MaxPayload is the largest accepted message payload: body bytes
+	// plus attachment bytes. Jobs above it are rejected at scheduling
+	// time — admission control: the message must be materialized in RAM
+	// at fire time, and the provider does not guarantee delivery beyond
+	// its own published bound anyway. Zero or negative disables the
+	// check (see defaultMaxPayload for the default's rationale).
+	MaxPayload int64
 
 	mu      sync.Mutex
 	pending SortedQueue
@@ -169,6 +210,7 @@ func NewScheduler(store *Store) *Scheduler {
 		store:      store,
 		Courier:    RealCourier{},
 		WarmLead:   defaultWarmLead,
+		MaxPayload: defaultMaxPayload,
 		wake:       make(chan struct{}, 1),
 		runnerDone: make(chan struct{}, 1),
 		fatal:      make(chan error, 1),
@@ -236,13 +278,39 @@ func (s *Scheduler) ScheduleWithID(id string, cfg mailer.MailConfig, content *ma
 	if len(c.To) == 0 {
 		return Job{}, fmt.Errorf("jobber: no recipients")
 	}
+	if len(c.To) > maxRecipients {
+		return Job{}, fmt.Errorf("jobber: %d recipients, but a single certified send is capped at %d (the default provider refuses more, and every ricevuta echoes the whole message back into the sender's mailbox); split the mailing into several jobs", len(c.To), maxRecipients)
+	}
 	for _, rcpt := range c.To {
-		if _, err := mail.ParseAddress(rcpt); err != nil {
+		a, err := mail.ParseAddress(rcpt)
+		if err != nil {
 			return Job{}, fmt.Errorf("jobber: invalid recipient address %q", rcpt)
 		}
+		// Bare-form rule: the envelope carries the address verbatim
+		// (RCPT TO:<%s>), so a display-name or bracketed form — which
+		// ParseAddress happily accepts — would go out as
+		// RCPT TO:<Name <a@b>>, a wire-level syntax error. Reject it here,
+		// at scheduling time, never at fire time.
+		if a.Address != rcpt {
+			return Job{}, fmt.Errorf("jobber: recipient %q must be the bare address %q (display names break the SMTP envelope)", rcpt, a.Address)
+		}
+		// RFC 5321 caps the whole RCPT path (surrounding angle brackets
+		// included) at 256 octets: anything longer is refused by every
+		// conformant provider — reject it here, at scheduling time.
+		if len(rcpt) > 254 {
+			return Job{}, fmt.Errorf("jobber: recipient %q is too long for the SMTP envelope (RFC 5321 caps the path at 256 octets)", rcpt)
+		}
 	}
-	if _, err := mail.ParseAddress(cfg.Username); err != nil {
+	sender, err := mail.ParseAddress(cfg.Username)
+	if err != nil {
 		return Job{}, fmt.Errorf("jobber: invalid certified address %q", cfg.Username)
+	}
+	// The certified identity must be bare too: it becomes MAIL FROM
+	// verbatim, and a display-name or bracketed form — accepted by
+	// ParseAddress — would break the envelope and poison the
+	// pre-generated Message-ID's domain.
+	if sender.Address != cfg.Username {
+		return Job{}, fmt.Errorf("jobber: certified address %q must be the bare address %q (display names break the SMTP envelope)", cfg.Username, sender.Address)
 	}
 	if c.Body == "" {
 		return Job{}, fmt.Errorf("jobber: empty body")
@@ -258,9 +326,21 @@ func (s *Scheduler) ScheduleWithID(id string, cfg mailer.MailConfig, content *ma
 		return Job{}, fmt.Errorf("jobber: fire time is %s away, but jobs must be scheduled at least %s in advance", lead.Round(time.Second), s.MinLead)
 	}
 
+	// Payload admission, fail-early like everything above: the message
+	// must be fully materialized in RAM at fire time (decoded job +
+	// built multipart, base64 ≈ 1.37x), and the default provider does
+	// not guarantee delivery above its published attachment bound at
+	// all — a message that big is a scheduling mistake, and it must die
+	// here, never at fire time. Zero or negative disables the check.
+	if s.MaxPayload > 0 {
+		if payload := int64(len(c.Body)) + attachmentBytes(c.Attachments); payload > s.MaxPayload {
+			return Job{}, fmt.Errorf("jobber: message payload is %s, above the %s per-job limit (-max-payload, in MB; 0 disables it — the default mirrors the provider's guaranteed delivery bound)", humanBytes(payload), humanBytes(s.MaxPayload))
+		}
+	}
+
 	// The Message-ID is pre-generated and persisted so that, even if the
 	// process dies mid-send, the recipient inbox can be searched for it.
-	mid, err := mailer.GenerateMessageID(domainOf(cfg.Username))
+	mid, err := mailer.GenerateMessageID(mailer.DomainOf(cfg.Username))
 	if err != nil {
 		return Job{}, fmt.Errorf("jobber: generating message-id: %w", err)
 	}
@@ -419,6 +499,17 @@ func (s *Scheduler) run(ctx context.Context, serve bool, ready func()) error {
 			jobs[i].ID, jobs[i].MessageID, jobs[i].MessageID)
 	}
 
+	// Boot sweep: rows persisted by an older gomailer can be terminal
+	// and still carry their mailbox credential (the strip-on-terminal
+	// invariant in Store.Update postdates them). Blank those in ONE
+	// atomic rewrite; pending and inflight rows keep theirs — the
+	// firing loop replays them at fire time.
+	if swept, err := s.store.BlankTerminalPasswords(); err != nil {
+		return fmt.Errorf("jobber: sweeping stale credentials from terminal jobs: %w", err)
+	} else if swept > 0 {
+		log.Printf("SECURITY swept the stored credential of %d terminal job(s) (they will never fire again; written by an older gomailer); pending jobs keep theirs", swept)
+	}
+
 	var pending SortedQueue
 	var sent, failed int
 	for _, j := range jobs {
@@ -466,20 +557,24 @@ func (s *Scheduler) run(ctx context.Context, serve bool, ready func()) error {
 
 		head := s.pending[0]
 		now := time.Now()
-		// Hand-off decision, made at peek time exactly as the hand-off is
-		// executed: a job whose warmup window has not opened yet is handed
-		// off WARM, at the window opening; a job whose window is already
-		// open (scheduled late, catch-up, or the loop was busy with
-		// earlier jobs) fires COLD — no warmup could still beat the
-		// deadline.
-		warm := s.WarmLead > 0 && now.Before(head.FireAt.Add(-s.WarmLead))
-		handoff := head.FireAt
-		if warm {
-			handoff = head.FireAt.Add(-s.WarmLead)
+		// Hand-off decision: dispatch as soon as the warm window opens.
+		// Dispatching EAGERLY — rather than only when the window is still
+		// strictly in the future — is what lets every job sharing a
+		// deadline get its own warm session: under the old rule the loop
+		// handed the first job off at the window opening, then evaluated
+		// the second a microsecond later, judged it "already past the
+		// window" and fired it cold at FireAt. Warmup is still skipped
+		// when too little time remains to finish it before the deadline
+		// (a job scheduled inside its window, or catching up) — but that
+		// is decided from the remaining time, not from which side of the
+		// window edge the loop happens to be on.
+		windowStart := head.FireAt
+		if s.WarmLead > 0 {
+			windowStart = head.FireAt.Add(-s.WarmLead)
 		}
-		if !now.Before(handoff) {
-			// Warm window open, due or overdue: hand the job to its own
-			// runner and immediately tend the next deadline.
+		windowOpen := s.WarmLead > 0 && !now.Before(windowStart)
+		if windowOpen || !now.Before(head.FireAt) {
+			warm := s.WarmLead > 0 && head.FireAt.Sub(now) >= min(minWarmBudget, s.WarmLead/2)
 			s.pending = s.pending[1:]
 			s.active[head.ID] = struct{}{}
 			s.mu.Unlock()
@@ -488,25 +583,14 @@ func (s *Scheduler) run(ctx context.Context, serve bool, ready func()) error {
 		}
 		s.mu.Unlock()
 
-		due, err := s.waitForUntil(ctx, handoff)
-		if err != nil {
+		// The warm window has not opened yet: sleep until it does and
+		// re-evaluate. The wait is chunked and recomputed against the
+		// absolute instant (see maxArm); an earlier submission wakes it
+		// early to re-arm (the wake hint may drop, so every path re-reads
+		// the queue after waking).
+		if err := s.waitForUntil(ctx, windowStart); err != nil {
 			return s.stop(err)
 		}
-		if !due {
-			continue // an earlier job became the head: re-evaluate
-		}
-		// The hand-off instant is due. Pop and hand off — but only if the
-		// head is still the job we slept for: an earlier submission can
-		// have raced the timer without its hint being consumed yet.
-		s.mu.Lock()
-		if len(s.pending) == 0 || s.pending[0].ID != head.ID {
-			s.mu.Unlock()
-			continue
-		}
-		s.pending = s.pending[1:]
-		s.active[head.ID] = struct{}{}
-		s.mu.Unlock()
-		go s.runJob(head, warm)
 	}
 }
 
@@ -587,14 +671,16 @@ func sleepUntil(until time.Time) {
 	}
 }
 
-// waitForUntil blocks until the given instant. It returns (true, nil) when
-// the instant is due and (false, nil) when the loop must re-evaluate its
-// head (an earlier job was scheduled mid-sleep); an error is returned
-// only when the run must stop (fatal store error or cancellation).
+// waitForUntil blocks until the given instant, or returns early so the
+// tender can re-evaluate (an earlier job was scheduled mid-sleep, which
+// arrives as a wake hint). Either way the caller re-reads the queue and
+// recomputes the next wait, so the distinction is not reported. An error
+// is returned only when the run must stop (fatal store error or
+// cancellation).
 //
 // The sleep is re-armed in chunks of at most maxArm, recomputing the
 // remaining wait against the absolute instant on every tick (see maxArm).
-func (s *Scheduler) waitForUntil(ctx context.Context, until time.Time) (bool, error) {
+func (s *Scheduler) waitForUntil(ctx context.Context, until time.Time) error {
 	for wait := time.Until(until); wait > 0; wait = time.Until(until) {
 		arm := min(wait, maxArm)
 		timer := time.NewTimer(arm)
@@ -602,16 +688,16 @@ func (s *Scheduler) waitForUntil(ctx context.Context, until time.Time) (bool, er
 		case <-timer.C:
 		case <-s.wake:
 			timer.Stop()
-			return false, nil
+			return nil
 		case err := <-s.fatal:
 			timer.Stop()
-			return false, err
+			return err
 		case <-ctx.Done():
 			timer.Stop()
-			return false, ctx.Err()
+			return ctx.Err()
 		}
 	}
-	return true, nil
+	return nil
 }
 
 // prewarm moves everything except the delivery off the fire-time critical
@@ -752,6 +838,33 @@ func (s *Scheduler) reportFatal(err error) {
 	}
 }
 
+// attachmentBytes totals the raw bytes of every attachment — the
+// scheduling-time snapshot that must live in the store until the fire
+// time and be materialized in RAM when the message is built.
+func attachmentBytes(atts []mailer.Attachment) int64 {
+	var n int64
+	for _, a := range atts {
+		n += int64(len(a.Data))
+	}
+	return n
+}
+
+// humanBytes renders a byte count in decimal units (MB = 10^6), the way
+// the -max-payload flag and provider limits are expressed.
+func humanBytes(n int64) string {
+	d := float64(n)
+	for _, unit := range []string{"B", "kB", "MB", "GB", "TB"} {
+		if d < 1000 {
+			if unit == "B" {
+				return fmt.Sprintf("%d B", n)
+			}
+			return fmt.Sprintf("%.1f %s", d, unit)
+		}
+		d /= 1000
+	}
+	return fmt.Sprintf("%.1f PB", d)
+}
+
 // runLock is the exclusive, non-blocking hold on <store>.runlock that
 // grants ONE process the right to fire jobs from a store. It is the hard
 // guarantee behind the one-daemon architecture: a second firing process —
@@ -783,13 +896,4 @@ func (l *runLock) release() {
 	}
 	_ = syscall.Flock(int(l.f.Fd()), syscall.LOCK_UN)
 	_ = l.f.Close()
-}
-
-// domainOf extracts the domain of a mailbox address, used to build the
-// pre-generated Message-ID.
-func domainOf(addr string) string {
-	if i := strings.LastIndexByte(addr, '@'); i >= 0 && i+1 < len(addr) {
-		return addr[i+1:]
-	}
-	return "localhost"
 }

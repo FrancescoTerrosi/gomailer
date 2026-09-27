@@ -81,3 +81,22 @@ func TestParseFireTimeRejectsGarbage(t *testing.T) {
 		t.Fatal("accepted empty fire time")
 	}
 }
+
+// TestParseFireTimeAtWinsOverIn pins the documented precedence: the -in
+// flag help says "(ignored when -at is set)" and the runbook says "-at
+// wins over -in" — but parseFireTime previously resolved -in first and
+// silently dropped a set -at.
+func TestParseFireTimeAtWinsOverIn(t *testing.T) {
+	got, err := parseFireTime("2030-06-15 12:00:00", "90s")
+	if err != nil {
+		t.Fatalf("parseFireTime: %v", err)
+	}
+	if got.Format("2006-01-02 15:04:05") != "2030-06-15 12:00:00" {
+		t.Fatalf("both flags set: resolved to %s — -at must win over -in", got.Format("2006-01-02 15:04:05"))
+	}
+	// An invalid -at is an error even when a valid -in sits beside it:
+	// -at is authoritative, not best-effort — no silent fallback.
+	if _, err := parseFireTime("garbage", "90s"); err == nil {
+		t.Fatal("invalid -at accepted because -in was also given")
+	}
+}

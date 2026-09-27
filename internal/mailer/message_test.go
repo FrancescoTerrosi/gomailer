@@ -36,8 +36,10 @@ func parseMessage(t *testing.T, msg string) (map[string]string, string) {
 	headers := map[string]string{}
 	name := ""
 	for _, ln := range strings.Split(head, "\r\n") {
-		if strings.HasPrefix(ln, " ") { // folded continuation: unfold (RFC 5322 removes the CRLF, keeps the WSP)
-			headers[name] += " " + strings.TrimLeft(ln, " ")
+		if strings.HasPrefix(ln, " ") || strings.HasPrefix(ln, "\t") {
+			// Folded continuation: unfolding removes only the CRLF and
+			// keeps the WSP byte — byte-exact, spaces and tabs alike.
+			headers[name] += ln
 			continue
 		}
 		var v string
@@ -280,6 +282,45 @@ func TestUnbrokenLongSubjectEncodes(t *testing.T) {
 	}
 	if got := decodeSubject(headers["Subject"]); got != orig {
 		t.Fatalf("decoded subject = %d bytes, want %d", len(got), len(orig))
+	}
+}
+
+// TestTabSeparatedLongSubjectFolds: a tab-separated subject (no spaces)
+// previously slipped through unfolded — longestToken counted tabs as
+// token breaks, but the folder folded only at spaces — emitting one
+// over-long physical line. Tabs must fold too, and byte-exactly.
+func TestTabSeparatedLongSubjectFolds(t *testing.T) {
+	orig := strings.Repeat("word\t", 400) // 2000 chars, tabs only, no spaces
+	c := MailContent{From: "sender@pec.test", To: []string{"dest@pec.test"}, Subject: orig, Body: "x"}
+	headers, _, msg := testBuild(t, &c)
+
+	if longestLine(msg) > smtpLineLimit {
+		t.Fatalf("tab-folded subject produced a %d-char line, want <= %d", longestLine(msg), smtpLineLimit)
+	}
+	// Unfolding must restore the original byte for byte (the fold keeps
+	// the tab as the continuation WSP; the helper unfolds likewise).
+	if headers["Subject"] != orig {
+		t.Fatal("unfolded subject differs from the original")
+	}
+}
+
+// TestSubjectHugeTokensStillSafe: a fold can only break at WSP, so a
+// line whose next WSP sits far past the threshold overflows even with
+// plain spaces — 899-char tokens here previously produced a 1808-char
+// physical line, because the old longestToken guard allowed tokens up to
+// headerWidth and the folder trusted it. The folded result must be
+// verified against the real budget and the over-budget case degraded
+// to encoded words.
+func TestSubjectHugeTokensStillSafe(t *testing.T) {
+	orig := strings.Repeat(strings.Repeat("X", 899)+" ", 6)
+	c := MailContent{From: "sender@pec.test", To: []string{"dest@pec.test"}, Subject: orig, Body: "x"}
+	headers, _, msg := testBuild(t, &c)
+
+	if longestLine(msg) > smtpLineLimit {
+		t.Fatalf("long-token subject produced a %d-char line, want <= %d", longestLine(msg), smtpLineLimit)
+	}
+	if got := decodeSubject(headers["Subject"]); got != orig {
+		t.Fatal("decoded subject differs from the original")
 	}
 }
 

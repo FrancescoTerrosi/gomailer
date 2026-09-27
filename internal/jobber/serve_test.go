@@ -9,6 +9,7 @@ package jobber
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -447,5 +448,60 @@ func TestInvalidRecipientRejectedAtScheduling(t *testing.T) {
 	c.To = []string{"not-an-address"}
 	if _, err := s.ScheduleWithID("bad-rcpt", testConfig(), &c, time.Now().Add(time.Hour)); err == nil {
 		t.Fatal("malformed recipient accepted")
+	}
+}
+
+// TestTooManyRecipientsRejectedAtScheduling: providers cap a single send
+// (Legalmail: 1000 between To and Cc) and every ricevuta echoes the
+// full message back into the sender's mailbox — a longer list is a
+// guaranteed fire-time refusal, so it dies at scheduling time.
+func TestTooManyRecipientsRejectedAtScheduling(t *testing.T) {
+	s := NewScheduler(testStore(t))
+	c := testContent("hi")
+	c.To = make([]string, maxRecipients+1)
+	for i := range c.To {
+		c.To[i] = fmt.Sprintf("dest%04d@pec.test", i)
+	}
+	if _, err := s.ScheduleWithID("crowd", testConfig(), &c, time.Now().Add(time.Hour)); err == nil {
+		t.Fatalf("%d recipients accepted; providers cap a send at %d", len(c.To), maxRecipients)
+	} else if !strings.Contains(err.Error(), "split the mailing") {
+		t.Fatalf("error must say what to do: %v", err)
+	}
+}
+
+// TestBareAddressFormsOnly: a display-name or angle-bracketed form parses
+// as a VALID address, but the envelope carries the raw string verbatim
+// (RCPT TO:<%s>), so it would go out as RCPT TO:<Name <a@b>> — a
+// wire-level syntax error at fire time. A display-name certified
+// identity additionally poisons the pre-generated Message-ID's domain
+// ("pec.it>"). All of it must be rejected at scheduling time.
+func TestBareAddressFormsOnly(t *testing.T) {
+	s := NewScheduler(testStore(t))
+	fire := time.Now().Add(time.Hour)
+
+	for i, rcpt := range []string{
+		"Rossi Mario <studio.rossi@pec.it>",  // display-name form
+		"<studio.rossi@pec.it>",              // bare angle-bracketed form
+		strings.Repeat("x", 248) + "@pec.it", // over RFC 5321's 256-octet path cap
+	} {
+		c := testContent("hi")
+		c.To = []string{rcpt}
+		if _, err := s.ScheduleWithID(fmt.Sprintf("bare-%d", i), testConfig(), &c, fire); err == nil {
+			t.Errorf("non-bare recipient %q accepted", rcpt)
+		}
+	}
+
+	// The certified identity obeys the same bare-form rule (MAIL FROM
+	// verbatim, Message-ID domain) — and the bare form still works.
+	cfg := testConfig()
+	cfg.Username = "Rossi Mario <sender@pec.test>"
+	c := testContent("hi")
+	c.From = cfg.Username
+	if _, err := s.ScheduleWithID("bare-sender", cfg, &c, fire); err == nil {
+		t.Error("display-name certified identity accepted")
+	}
+	plain := testContent("bare ok")
+	if _, err := s.ScheduleWithID("bare-plain", testConfig(), &plain, fire); err != nil {
+		t.Fatalf("bare certified address must still be accepted: %v", err)
 	}
 }

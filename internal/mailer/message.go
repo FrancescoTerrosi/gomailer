@@ -152,18 +152,24 @@ const headerWidth = 900
 
 // renderSubject renders the Subject value, folding anything that would
 // overflow the SMTP line limit. Folding an unstructured header at
-// whitespace is lossless: unfolding removes only the CRLF, so a compliant
-// reader sees the identical value. Values that cannot fold at whitespace
-// (one huge token, or non-ASCII long enough that its encoded form
-// overflows) are emitted as several RFC 2047 B-words joined by folds —
-// adjacent encoded words concatenate on decoding, so that is lossless too.
+// whitespace (space or tab) is lossless: unfolding removes only the CRLF
+// and keeps the WSP byte, so a compliant reader sees the identical value.
+// A fold can only break AT whitespace, though — a token may run far past
+// the fold threshold before the next break — so the folded result is
+// VERIFIED against the real budget (line limit minus the "Subject: "
+// prefix), and anything that still overflows (one huge token, or
+// non-ASCII long enough that its encoded form overflows) is emitted as
+// several RFC 2047 B-words joined by folds instead: adjacent encoded
+// words concatenate on decoding, so that is lossless too.
 func renderSubject(subj string) string {
 	subj = stripNewlines(subj)
 	if v := encodeHeaderWord(subj); len(v) <= headerWidth && !strings.ContainsAny(v, "\r\n") {
 		return v
 	}
-	if isASCII(subj) && longestToken(subj) <= headerWidth {
-		return foldAtSpaces(subj)
+	if isASCII(subj) {
+		if v := foldAtWhitespace(subj); maxLineLen(v)+len("Subject: ") <= smtpLineLimit {
+			return v
+		}
 	}
 	return foldBWords(subj)
 }
@@ -192,31 +198,21 @@ func foldAddressList(addrs []string) string {
 	return b.String()
 }
 
-// longestToken returns the longest space-free run in s.
-func longestToken(s string) int {
-	longest, n := 0, 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == ' ' || s[i] == '\t' {
-			n = 0
-		} else {
-			n++
-			if n > longest {
-				longest = n
-			}
-		}
-	}
-	return longest
-}
-
-// foldAtSpaces folds s at its spaces so no line exceeds headerWidth. Each
-// fold replaces a space with CRLF+space — unfolding restores the exact
-// original byte for byte.
-func foldAtSpaces(s string) string {
+// foldAtWhitespace folds s at its space and tab bytes so lines approach
+// the headerWidth budget. The fold inserts a CRLF right before the WSP
+// byte, which stays on as the continuation WSP — unfolding removes only
+// the CRLF and keeps that byte, so the decoded value is byte-exact.
+// Because a fold can only break at WSP, a line whose next WSP sits past
+// the threshold still overflows: callers must VERIFY the result against
+// the real line budget (see renderSubject), not trust the input's token
+// lengths.
+func foldAtWhitespace(s string) string {
 	var b strings.Builder
 	n := 0
 	for i := 0; i < len(s); i++ {
-		if s[i] == ' ' && n >= headerWidth {
-			b.WriteString("\r\n ")
+		if n >= headerWidth && (s[i] == ' ' || s[i] == '\t') {
+			b.WriteString("\r\n")
+			b.WriteByte(s[i]) // the WSP survives the fold as the continuation byte
 			n = 1
 			continue
 		}
@@ -275,8 +271,11 @@ func GenerateMessageID(domain string) (string, error) {
 	return fmt.Sprintf("<%s@%s>", id, domain), nil
 }
 
-// domainOf returns the domain part of a mailbox address.
-func domainOf(addr string) string {
+// DomainOf returns the domain part of a mailbox address — the right-hand
+// side of a pre-generated Message-ID. Parsing first (not just splitting
+// at the last '@') keeps display-name and bracketed forms from leaking
+// junk like "pec.it>" into the Message-ID.
+func DomainOf(addr string) string {
 	if a, err := mail.ParseAddress(addr); err == nil {
 		if i := strings.LastIndexByte(a.Address, '@'); i >= 0 {
 			return a.Address[i+1:]
