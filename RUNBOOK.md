@@ -26,18 +26,19 @@ Message-IDs will differ; the shapes are exactly what you will see.
     go build -o gomailer .
     sudo install -m755 gomailer /usr/local/bin/gomailer
     sudo install -m644 gomailer.service /etc/systemd/system/gomailer.service
-    sudo install -d -m755 /etc/sysusers.d            # not shipped by Ubuntu/Debian
-    sudo install -m644 gomailer.sysusers.conf /etc/sysusers.d/gomailer.conf
+    sudo install -D -m644 gomailer.sysusers.conf /etc/sysusers.d/gomailer.conf
     sudo systemd-sysusers                # creates the gomailer user/group
     sudo systemctl daemon-reload
     sudo systemctl enable --now gomailer
 
 `systemd-sysusers` reads [gomailer.sysusers.conf](gomailer.sysusers.conf) and
 creates the dedicated `gomailer` system account; it is idempotent, so
-re-running the install is safe. (Ubuntu/Debian do not ship `/etc/sysusers.d`
-— hence the `install -d` line; `/usr/lib/sysusers.d/gomailer.conf` works
-equally, both are in systemd-sysusers' search path, and `/etc` takes
-precedence.) The service runs as that user, and systemd's
+re-running the install is safe. (`/etc/sysusers.d` is the admin override
+tier — nothing in the Ubuntu/Debian archive writes there, so a stock
+system doesn't ship the directory; `install -D` creates it together with
+the file. `/usr/lib/sysusers.d/gomailer.conf` works equally, both are in
+systemd-sysusers' search path, and `/etc` takes precedence.) The service
+runs as that user, and systemd's
 `StateDirectory=` creates `/var/lib/gomailer` (0700) owned by it — no manual
 `mkdir`/`chown`, and the store never runs as root. The unit also sandboxes
 the daemon: read-only filesystem except the state dir, a `@system-service`
@@ -52,6 +53,42 @@ owner-only, **scheduling clients must run as the same `gomailer` user**:
 
     sudo -u gomailer env PEC_PASSWORD=... gomailer -in 2m -to dest@pec.it \
           -subject S -body B -store /var/lib/gomailer/jobs.json
+
+Typing `sudo -u gomailer` and `-store` for every client is friction, not
+security — sudo IS the privilege boundary (the `gomailer` account is
+locked, so `su` cannot reach it), so the fix is to hide it, not remove it.
+Two tiers:
+
+**Tier 1 — a shell function** (per operator, no admin rights) — which also
+pins the store (killing the stray-store footgun) and prompts for the
+password off-tty so it never lands in shell history or argv:
+
+    gm() {
+      [ -n "$PEC_PASSWORD" ] || { printf 'PEC password: ' >&2; stty -echo; read PEC_PASSWORD; stty echo; printf '\n' >&2; export PEC_PASSWORD; }
+      sudo -u gomailer env PEC_PASSWORD="$PEC_PASSWORD" \
+           gomailer -store /var/lib/gomailer/jobs.json "$@"
+    }
+    gm -in 2m -to dest@pec.it -subject S -body B -attach contratto.pdf
+
+**Tier 2 — a contained sudoers grant** (once per machine) drops even the
+password prompt — exactly one binary, one target user:
+
+    # /etc/sudoers.d/gomailer     (validate: sudo visudo -cf /etc/sudoers.d/gomailer)
+    Defaults!/usr/local/bin/gomailer env_keep += "PEC_PASSWORD"
+    %gomailer-ops ALL=(gomailer) NOPASSWD: /usr/local/bin/gomailer
+
+plus a thin wrapper `/usr/local/bin/gm` pinning `-store`:
+
+    #!/bin/sh
+    [ -n "$PEC_PASSWORD" ] || { printf 'PEC password: ' >&2; stty -echo; read PEC_PASSWORD; stty echo; printf '\n' >&2; export PEC_PASSWORD; }
+    exec sudo -u gomailer /usr/local/bin/gomailer -store /var/lib/gomailer/jobs.json "$@"
+
+Operators in `gomailer-ops` (create it with `groupadd`) then schedule with
+plain `gm -in 2m ...`. NEVER grant `NOPASSWD: /usr/bin/env` instead — `env`
+execs anything, which is arbitrary code as gomailer; Tier 2 allows the
+binary directly and carries the password via the per-command `env_keep`.
+For a burst of interactive scheduling, `sudo -u gomailer -s` also works
+(the nologin shell blocks `sudo -i`, not `sudo -s`).
 
 ## 3. The daemon: run, check, stop
 
@@ -271,17 +308,19 @@ Fix the cause, schedule again.
 | `WARNING: no password given` | empty `-pass`/`$PEC_PASSWORD` at scheduling | the send WILL fail at auth — re-schedule with credentials |
 | `FAILED … err=mailer: auth: …` / `tls dial` / `starttls` | provider rejected at fire time | fix credentials/network; schedule a new job; the failed one stays as history |
 | Clients keep falling back although a daemon runs | socket file deleted or `-sock` mismatch | restart the daemon (it recreates the socket); check clients and daemon use the same `-store` (the default socket is `<store dir>/gomailer.sock`) |
-| `systemctl stop` hangs past ~a minute | a send is wedged on an unresponsive provider | let systemd's kill timeout fire (TimeoutStopSec=90s, pinned in the unit); that send becomes the crash-during-send case → §7 |
+| `systemctl stop` is slow to return | a runner holding a staged dot is committed: it finishes its commit at the fire time, bounded by the warm window plus the per-command read/write deadlines — all sized inside `TimeoutStopSec=90s` | nothing: wait for the drain; a wedged provider now fails the job inside its deadline instead of hanging the stop |
 | Everything fires seconds late | machine clock not NTP-synced | `timedatectl`; lateness is measured against the local clock |
 | `-ping` fine but you expected more pending jobs | wrong store path | `-ping`/`-list`/daemon must share one `-store` |
 
 ## 9. Timing verification
 
-The daemon's log is the evidence: `WARM` (session opened `-lead` before),
-`FIRE` (µs-stamped, with measured lateness), `SENT`. Two jobs scheduled for
-the same instant fire **in parallel**, each over its own warm session
-(the tending loop hands every job off as its window opens, not just the
-first):
+The daemon's log is the evidence: `WARM` (session opened in the window),
+`STAGED` (envelope and full message at the provider, `upload=` measuring
+the streaming), `FIRE` (µs-stamped, with measured lateness — for a staged
+job it stamps **the dot**, the delivery act), `SENT` (whose `send=` is
+then just the commit round-trip). Two jobs scheduled for the same instant
+fire **in parallel**, each over its own held transaction (the tending
+loop hands every job off as its window opens, not just the first):
 
     ... WARM  job=6fd59f3e757a25e3 msgid=<7d1af80b-...> session ready in 49ms (2.945s before fire)
     ... WARM  job=63023c51573b764e msgid=<df4006e2-...> session ready in 51ms (2.955s before fire)
@@ -327,11 +366,13 @@ against a drifting clock. Lateness ≥2s is flagged explicitly as catch-up.
 | `queue: N pending, …` | boot snapshot after recovery |
 | `daemon: accepting submissions on …` | socket is live — health checks turn green |
 | `WARM … session ready in …` | warmup done off the critical path |
-| `WARM … failed …: cold fallback` | warmup failed; job still meets its deadline cold |
-| `FIRE … lateness=…` | send starting, µs-stamped; `(cold)` = no warm session |
+| `STAGED … upload=…` | envelope and full message at the provider, held one dot short of delivery |
+| `WARM … failed …: cold fallback` | warmup or staging failed before the dot; job still meets its deadline cold |
+| `FIRE … lateness=…` | the delivery act, µs-stamped — the dot write for a staged job; `(cold)` = no staged transaction, no warm session |
+| `WARNING … held transaction lost …: cold send at fire time` | the dot never left the wire; exactly one cold full send started at the fire time |
 | `WARNING … FIRED <delay> LATE` | catch-up: no firing process existed at the deadline |
 | `SENT … send=…` | provider accepted the message |
-| `FAILED …` | terminal failure, never auto-retried — read `err=` |
+| `FAILED …` | terminal failure, never auto-retried — read `err=`; an error carrying `delivery dot was written, outcome uncertain` means the send MIGHT have gone out: verify the recipient inbox for the Message-ID (the §7 crash procedure) |
 | `RECOVER …` | boot found a job interrupted mid-send: manual verification |
 | `SECURITY swept …` | boot found terminal rows still carrying a credential (written by an older gomailer) and blanked it |
 | `CRITICAL … send result could not be persisted` | send happened but the store write failed; next boot flags it |

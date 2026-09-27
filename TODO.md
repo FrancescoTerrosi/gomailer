@@ -131,6 +131,16 @@ provider-mirrored; `0` disables) and the ≤1000 recipient cap now live
 in `ScheduleWithID`, with `-max-payload` as a daemon-side policy flag.
 What remains in this item is only the SQLite endgame.
 
+**Coupling with receipt type (2026-09-27 note)**: with ricevuta `breve`,
+the consegna attests delivery via headers + DIGEST of the original —
+matching that digest at dispute time requires the original bytes, which
+exist only in the store row (body + attachments, kept as history by
+design). Any store-slimming endgame (blob eviction, SQLite blobs,
+cleanup) must NOT evict payloads of jobs whose receipts are digest-based
+(`breve`), or it silently destroys the verification half of the legal
+chain. Retention policy and receipt-type policy are coupled — decide
+together (see item 5). What today reads as bloat is also evidence.
+
 ## 3. Credentials: strip at terminal (shipped) + encrypt at rest (designed, not yet built)
 
 Two layers, one threat model.
@@ -217,6 +227,201 @@ sessions must still be live at FireAt to fire N jobs simultaneously.
 
 No action planned until a real burst workload needs it; the correctness
 half (every imminent job takes the warm path) is done.
+
+## 5. Ricevuta type: selectable per job + the fat-`completa` echo hazard (designed, not yet built)
+
+**Why deferred**: the live workload turned out to be regularly fat (a
+14-attachment send measured `send=9.46s`, ~18-25 MB payload), and the
+receipt type — which is sender policy per DM 2 nov 2005 — is currently
+hardwired: the CLI sets `TipoRicevuta: completa` (main.go), socket/library
+clients can already set it (the field rides `Request.Content` and the
+store row), and `build()` normalizes empty → `completa`.
+
+**The hazard** (the reason this is not just a flag): ricevuta `completa`
+echoes the FULL ORIGINAL MESSAGE back into the SENDER's mailbox PER
+RECIPIENT; the provider's published rule is that receipts exceeding the
+mailbox quota "non saranno recapitate" — the consegna, i.e. the legal
+proof of delivery, is silently lost. For the fat workload that means
+~20 MB × recipients re-arriving at the sender mailbox (and a fat receipt
+relaying gestore→gestore back). With `breve` the receipt is headers +
+digest: full delivery proof, no echo — the recommended org default for
+fat sends (pin `-ricevuta breve` in the operator wrapper).
+
+**The gap**: `ScheduleWithID` never validates the value — a socket
+submission with `tipoRicevuta: "banana"` persists and fires, emitting
+`X-TipoRicevuta: banana` on a legally binding message → undefined receipt
+behavior, surfacing (if at all) as missing ricevute long after. Same
+fail-early family as recipient/payload validation.
+
+**Verified facts worth keeping** (live probes, 2026-09-27):
+- the tipo does NOT affect the recipient deposit time: the consegna is
+  generated AFTER the deposit it attests — tipo is downstream. It only
+  delays (or loses, via quota) the evidence arriving in the SENDER's
+  mailbox;
+- `accettazione` is not tipo-selected (envelope + headers always);
+- `X-Ricevuta` is set by the RECEIVER when generating receipts — honoring
+  of the requested tipo is verifiable post-hoc on received ricevute
+  (correlate by Message-ID), never enforceable pre-hoc; no protocol
+  mechanism lets a recipient's gestore reject or require a tipo;
+- `sintetica` is the least-exercised type in the wild — interop caution,
+  live-provider-test discipline applies before relying on it.
+
+**Fix sketch (designed; ~50-70 lines + tests; no protocol bump, no store
+schema change — the field has traveled since protocol 1)**:
+- CLI flag `-ricevuta completa|breve|sintetica`, default `completa`
+  (domain cultural default, backward compatible; orgs pin their policy
+  in the client wrapper);
+- validation in `ScheduleWithID` (the one seam covering daemon socket +
+  CLI fallback): reject values outside the three; resolve empty →
+  `completa` AT SCHEDULING so the store row carries the decision, not
+  the omission;
+- fat-`completa` WARNING at scheduling (client stderr + daemon journal;
+  the protocol has no warning channel — `ok:false` is rejection-only):
+  state the echo math (payload × recipients) — warning, not rejection,
+  because the real limit is the unknowable sender mailbox quota;
+- payload bytes into the `SCHEDULED` log line — already computed by the
+  `-max-payload` admission check; also makes `send=` decomposable into
+  an uplink MB/s baseline.
+
+Also measured while at it: `send=9.46s` for that fat job is irreducible
+in-tool — it is bandwidth × (payload × 1.37 base64) + provider-side
+accept work; Legalmail advertises no `BINARYMIME` (Aruba does), a single
+DATA stream cannot be parallelized, and pre-uploading DATA before
+FireAt would be a prefire (forbidden by the no-early-deposit floor).
+The only levers live outside gomailer: uplink, payload size, provider.
+
+**Amendment (2026-09-27, later same day)**: the last sentence above is
+wrong in one precise way — see item 6. There IS an in-tool lever:
+holding the terminating dot. The prefire prohibition applies to
+*delivery* (the dot), not to *bytes on the wire*; the two are separable.
+
+## 6. Fat sends: pre-upload at warmup, hold the terminating dot, commit at FireAt (code shipped 2026-09-27; live provider probe pending)
+
+**Shipped (2026-09-27)** — as designed below, with the settled parameters
+(20s hold budget, "just go"):
+
+- `mailer.StageOn`/`Staged.Commit` (mailer.go): envelope + full DATA upload
+  in the warm window, the dot split from the 250 read (the raw textproto
+  dot-writer, not `Client.Data`'s dataCloser), the bufio tail flushed before
+  the hold (µs dot precision), `ErrDotOut` marking everything at-or-after
+  the dot as terminal ambiguity (verify, never retry).
+- Per-command read/write deadlines (§4.5.3.2, the stop-hang corner):
+  a sliding per-chunk deadline on the transport (30s), the dot write (30s)
+  and the answer read (60s) — all inside TimeoutStopSec=90s.
+- Scheduler (scheduler.go): payload-aware warm windows (`stagedLead`:
+  connect+auth + RCPT round-trips + payload/UplinkRate + HoldBudget, floored
+  at `-lead`); queue-wide dispatch scan (a fat job deep in the queue can
+  carry the earliest window); staging in prewarm; the "just go" fire paths
+  (finish-then-dot on overrun, cold full send at the fire time when the dot
+  write fails, terminal verify when the dot left). Logged `STAGED upload=…`
+  is the uplink baseline item 5 wants.
+
+**Still pending before it runs against the certified provider**: the live
+held-dot probe (the item-1 discipline — no wire-behavior change without
+one): stage a probe job against Legalmail, hold ~20s, dot, and verify the
+250 arrives and no accettanza precedes it. The uplink estimate is a
+conservative static constant (`UplinkRate`, 2 MB/s) pending item 5's
+logged-upload baseline.
+
+**The question it answers**: the regular-fat workload pays `send=9.5s`
+because the whole DATA transfer sits after the fire instant. SMTP has no
+stage-then-commit command, but DATA has a mechanical equivalent: issue
+DATA and stream the entire message during the warm window, hold back only
+the terminating `CRLF.CRLF`, write those bytes at FireAt. The message is
+not a message until the dot — no queue entry, no accettazione, no
+ricevuta, nothing recipient-visible — so at-most-one-delivery holds (the
+dot IS the delivery act) and the no-early-deposit floor holds with the
+same causal proof (deposit ≥ dot ≥ FireAt). The µs fire discipline moves
+onto the dot.
+
+**What it buys**: fat sends commit at T+RTT (~0.3s 250) instead of
+T+upload; and the crash-ambiguity window SHRINKS — a crash before the dot
+is provably not-delivered (today a crash mid-fat-upload is genuinely
+ambiguous for the whole upload length); only dot→250 stays ambiguous.
+
+**Sharp edges (settle before building)**:
+- payload-aware warm windows: `-lead` is a daemon-wide 5s and does not
+  fit a 9.5s upload; open the window at `T − (uploadEstimate + slack)`
+  per job — payload is known at scheduling time, uplink MB/s baselined
+  from logged uploads (needs item 5's payload logging);
+- no liveness probe exists inside a DATA transaction: a session silently
+  dropped during the hold is discovered at the dot → cold redo → the fat
+  job lands ~T+9.5s. Acceptable for the floor workload (late is allowed);
+  not for tight "by X" margins. Aggressive TCP keepalives narrow
+  detection, cannot prevent;
+- the provider's held-dot timeout: the closest RFC 5321 mandate is
+  server-side and a SHOULD — §3.8 lets a server close only "after a
+  timeout, as specified in Section 4.5.3.2, occurs waiting for the
+  client to send a command *or data*", and §4.5.3.2.7 requires the
+  server to wait "at least 5 minutes". (The 10-min figure in
+  §4.5.3.2.6 is the CLIENT's timeout awaiting the 250 AFTER the dot —
+  an earlier version of this note misattributed it to the server.)
+  Real-world defaults: Postfix smtpd_timeout 300s per read (including
+  DATA), Sendmail Timeout.datablock 1h. A ~20s hold is 15× inside the
+  normative floor — but Legalmail's actual config is still unknown:
+  live test before trusting long holds (the item 1 precedent: no
+  wire-behavior change against the certified provider without one);
+- the mechanism is the RFC's own state machine: §4.1.1.4 — "Receipt of
+  the end of mail data indication requires the server to process the
+  stored mail transaction information"; §3.3 — the dot "confirms the
+  mail transaction"; §4.2.5 — responsibility transfers at the 250
+  after <CRLF>.<CRLF>. The server is not merely allowed to sit on
+  uploaded bytes uncommitted; that is its defined state;
+- client-side timeouts are a MUST for us too (§4.5.3.2: per-command
+  deadlines): the commit read (awaiting the 250 after the dot) should
+  carry the §4.5.3.2.6 SHOULD (10 min) — but pick ≤ TimeoutStopSec=90s
+  so a wedged post-dot read never outlives the unit's stop budget;
+  today the SMTP session has no read/write deadlines at all (the
+  known stop-hang corner), and hold-the-dot must not ship without
+  adding them;
+- the invariant must be worded deliberately: bytes DO sit on the
+  provider's wire before FireAt. Nothing observable exists before the
+  dot, but "no bytes leave before X" (vs "recipient cannot receive
+  before X") is the stricter reading — decide, then document it in the
+  RUNBOOK whichever way;
+- FIRE semantics: `fire=` must stamp the dot; log should split
+  `upload=` (warmup) vs `commit=` (fire) for the paper trail.
+
+Provider note: Aruba advertises `CHUNKING`/`BDAT` (the standardized form
+of this trick — the last chunk completes the message); Legalmail does
+NOT (EHLO-verified 2026-09-27) — raw DATA hold-the-dot is the only form
+available against the default provider. Implementation seam in today's
+code is small: `SendOn`'s `w.Write(msg)` + `w.Close()` split across the
+hold — small code change, big semantic change.
+
+**Settled (2026-09-27): the hold budget is ~20s, and the failure policy
+is "just go".** The payload-aware window opens at
+`T − (uploadEstimate + ~20s)`; an upload that finishes on estimate holds
+the dot for ~20s, one that overruns shrinks the hold (down to zero and
+into finish-then-dot). 20s sits 15x inside the 300s normative floor
+(§4.5.3.2.7, a SHOULD), ~4x inside `TimeoutStopSec=90s`, and under every
+middlebox idle default — but deployed configurations below the RFC
+floor are real (cPanel-Exim ships `smtp_receive_timeout=165s`; Azure LB
+4 min; AWS NLB 350s, fixed for TLS listeners), so the live-provider test
+stays mandatory.
+
+"Just go" is one rule: **the dot is floor-anchored — never before
+FireAt, and never later than the earliest instant possible at or after
+it.** Whatever state the runner finds itself in at FireAt:
+
+- upload complete, session alive → write the dot (the win case);
+- upload still streaming → keep streaming and dot at completion — never
+  abandon a partial upload (the remaining fraction is always cheaper
+  than a fresh full upload; lateness = the overrun, logged);
+- session dead (the dot write fails, or keepalive flagged the drop) →
+  cold full send STARTING AT FireAt (connect+auth+envelope+upload+dot on
+  a fresh session) — never delay FireAt to re-warm;
+- warmup never succeeded → today's cold path, unchanged.
+
+"Just go" governs lateness tolerance only; it does NOT override the
+no-early-deposit floor: a SIGTERM mid-hold does not pull the dot
+earlier (the runner is committed; `sleepUntil(FireAt)` is deliberately
+uninterruptible), and no opportunistic re-warm loop is built — a drop
+detected before FireAt is still handled at FireAt. One code path, no
+budget arithmetic; a cold send for a fat job lands ~T+9.5s, which the
+floor workload accepts (late is allowed). The at-most-one invariant is
+thereby worded: at most one COMPLETED message (one dot) per fire — a
+first attempt that never dotted is not a delivery.
 
 ## Other known corners (from the audit — cosmetic, no action planned)
 

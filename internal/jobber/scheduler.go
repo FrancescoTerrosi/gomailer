@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/mail"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,9 +27,32 @@ import (
 // Production wires RealCourier (the PEC mailer); tests inject fakes that
 // record call instants. The session value is opaque to the scheduler.
 type Courier interface {
+	// Prepare renders the wire message (pure CPU).
 	Prepare(cfg mailer.MailConfig, content *mailer.MailContent) ([]byte, error)
+	// Warm opens an authenticated provider session (network).
 	Warm(cfg mailer.MailConfig) (any, error)
+	// Stage moves everything except the delivery act off the fire-time
+	// critical path: envelope + DATA + the full message bytes, leaving
+	// the transaction ONE DOT short of delivery. It is called immediately
+	// after Warm (no idle gap to probe). The returned handle is opaque;
+	// nil means "not staged" — the job then delivers at the fire time over
+	// the warm session, exactly as before staging existed. Every Stage
+	// failure precedes the dot by construction, so the caller must
+	// degrade to a cold send at the fire time ("just go"), never abandon
+	// the job.
+	Stage(cfg mailer.MailConfig, session any, msg []byte, to []string) (any, error)
+	// Commit performs the delivery act (the terminating dot) and reads
+	// the provider's answer; call it at or after the fire time, exactly
+	// once, never before. Errors wrapping mailer.ErrDotOut mean the dot
+	// left the wire: terminal ambiguity, never re-attempted — only
+	// verified against the recipient inbox. Any other error means
+	// nothing was delivered: the caller falls back to one cold full send
+	// at the fire time.
+	Commit(cfg mailer.MailConfig, staged any) error
+	// Send is the cold path: one full delivery attempt — connect, auth,
+	// envelope, upload, dot, answer — back to back.
 	Send(cfg mailer.MailConfig, session any, msg []byte, to []string) error
+	// Discard releases a session that will no longer be used.
 	Discard(session any)
 }
 
@@ -41,6 +65,19 @@ func (RealCourier) Prepare(cfg mailer.MailConfig, c *mailer.MailContent) ([]byte
 
 func (RealCourier) Warm(cfg mailer.MailConfig) (any, error) {
 	return cfg.WarmUp()
+}
+
+func (RealCourier) Stage(cfg mailer.MailConfig, session any, msg []byte, to []string) (any, error) {
+	sess, _ := session.(*mailer.Session)
+	return cfg.StageOn(sess, msg, to)
+}
+
+func (RealCourier) Commit(cfg mailer.MailConfig, staged any) error {
+	st, _ := staged.(*mailer.Staged)
+	if st == nil {
+		return fmt.Errorf("jobber: no staged transaction to commit")
+	}
+	return st.Commit()
 }
 
 func (RealCourier) Send(cfg mailer.MailConfig, session any, msg []byte, to []string) error {
@@ -79,10 +116,36 @@ const defaultWarmLead = 5 * time.Second
 // window opening" (warm) and "scheduled inside the window, or catching
 // up" (cold). It is ~3x the measured connect+auth cost against the real
 // provider (~100-300ms), so a warmup that starts with this much time
-// left comfortably finishes before the deadline. Capped at WarmLead/2 so
-// a deliberately short -lead still warms the jobs dispatched at its own
-// window opening.
+// left comfortably finishes before the deadline. Capped at half the
+// job's warm window (see stagedLead) so a job dispatched at its own
+// window opening always warms, whatever the window's size.
 const minWarmBudget = time.Second
+
+// Staging estimates for sizing a job's warm window (see stagedLead).
+const (
+	// connectAuthBudget: open + authenticate the session. Measured
+	// ~100-300ms against the real provider; one second is generous.
+	connectAuthBudget = time.Second
+	// rcptBudget: one envelope round trip per recipient — net/smtp is
+	// lock-step (no pipelining), so a long recipient list pays RTT each.
+	rcptBudget = 50 * time.Millisecond
+)
+
+// defaultHoldBudget is the slack added on top of the staging estimate
+// when sizing a staged job's warm window: an upload that finishes on
+// estimate holds its dot this long before FireAt; one that overruns
+// shrinks the hold (down to zero, into finish-then-dot — never an
+// abandoned upload). 20s sits 15x inside the 300s server-timeout floor
+// (RFC 5321 §4.5.3.2.7, a SHOULD) and ~4x inside the unit's stop budget
+// (TimeoutStopSec=90s), and under the idle timeouts of common
+// middleboxes — see TODO.md item 6 for the full clock ladder.
+const defaultHoldBudget = 20 * time.Second
+
+// defaultUplinkRate is the assumed payload throughput (decimal bytes/s)
+// used to estimate the upload leg of a staged window: a conservative
+// floor of the measured fat workload (~20MB payload in 9.5s ≈ 2 MB/s).
+// The logged STAGED upload= durations are the data for tightening it.
+const defaultUplinkRate = 2 * 1000 * 1000
 
 // defaultMaxPayload is the per-job payload admission default (body +
 // attachment bytes). It mirrors the default provider's published
@@ -116,6 +179,12 @@ var errJobTerminal = errors.New("jobber: job reached a terminal state during war
 type warmState struct {
 	msg     []byte
 	session any
+	// staged is the held DATA transaction (see Courier.Stage): envelope
+	// and full message already at the provider, one dot short of
+	// delivery. nil means "deliver cold" — over the warm session when
+	// one exists (couriers that do not stage), or from scratch when even
+	// that failed. It is runner-local like the rest of warmState.
+	staged any
 }
 
 // Scheduler fires pending jobs from a Store at their exact FireAt.
@@ -129,15 +198,15 @@ type warmState struct {
 //
 // The tending loop owns the queue and nothing else: it sleeps toward the
 // next hand-off instant and hands each job to a dedicated runner
-// goroutine when its warmup window opens (WarmLead before FireAt) or when
-// it is due. Runners are fully independent: each builds its message,
+// goroutine when its warm window opens (payload-aware, WarmLead is the
+// floor — see stagedLead) or when it is due. Runners are fully independent: each builds its message,
 // opens its own provider session, waits out its own chunked timer to the
 // exact fire instant and delivers. Jobs that share a deadline fire
 // CONCURRENTLY, each over its own session, and a slow SMTP send can never
 // delay another job's fire: the strict per-job time budget holds no
 // matter how many jobs are in flight. Concurrency is bounded by the
-// workload: only jobs within WarmLead of their fire time are handed off,
-// so one session per imminent fire.
+// workload: only jobs inside their warm window are handed off, so one
+// held session per imminent fire.
 //
 // Ownership: a popped job belongs to exactly one runner until it reaches
 // a terminal state — it is never re-queued. That keeps the exactly-one-
@@ -150,14 +219,17 @@ type warmState struct {
 // earlier job was scheduled, or on a chunk tick — no polling, no
 // cumulative drift, even over long leads.
 //
-// Warmup: WarmLead before FireAt the message is built, the crash-safety
-// "inflight" marker is persisted and an authenticated provider session is
-// opened, so at FireAt only the envelope/data round-trips remain.
-// Warmup is best-effort: any failure degrades to a cold send at FireAt
-// and never costs the job its deadline. Every job is handed off as its
-// warm window opens; one that reaches the loop with too little time left
-// to finish warmup (scheduled inside the window, or catching up) fires
-// cold — see minWarmBudget.
+// Warmup: the job's window opens stagedLead before FireAt. The message
+// is built, the crash-safety "inflight" marker is persisted, an
+// authenticated provider session is opened, and the whole transaction —
+// envelope and full DATA upload — is STAGED and held one dot short of
+// delivery, so at FireAt only the terminating dot (the delivery act)
+// and the provider's answer remain. Every step is best-effort: any
+// failure degrades to a cold send at FireAt and never costs the job its
+// deadline ("just go"). Every job is handed off as its warm window
+// opens; one that reaches the loop with too little time left to finish
+// warmup (scheduled inside the window, or catching up) fires cold — see
+// minWarmBudget.
 type Scheduler struct {
 	store *Store
 
@@ -170,11 +242,29 @@ type Scheduler struct {
 	// 24/7 service sets this to 24h; the CLI test tool defaults to 0.
 	MinLead time.Duration
 
-	// WarmLead is how far before FireAt the warmup phase starts. Every job
-	// is dispatched as its window opens; a dispatch with at least
-	// min(minWarmBudget, WarmLead/2) left to FireAt warms, one with less
-	// fires cold. Zero disables warmup.
+	// WarmLead is the FLOOR of a job's warm window in time. Windows are
+	// payload-aware (see stagedLead): a job whose staging needs longer —
+	// many recipients, a fat upload — opens earlier, by its own
+	// estimate plus HoldBudget; every warmed job is then staged and holds
+	// its dot until FireAt (see Courier.Stage). WarmLead 0 disables
+	// warmup — and with it staging — entirely: every job fires cold.
 	WarmLead time.Duration
+
+	// HoldBudget is the slack added on top of the staging estimate when
+	// sizing a job's warm window: an upload that finishes on estimate
+	// holds its dot this long before FireAt; one that overruns shrinks
+	// the hold, down to zero and into finish-then-dot ("just go": the
+	// dot is floor-anchored, never before FireAt, never delayed past the
+	// earliest instant possible after it). Default 20s (see
+	// defaultHoldBudget for the clock-ladder rationale).
+	HoldBudget time.Duration
+
+	// UplinkRate is the assumed payload throughput (bytes per second)
+	// used to estimate the upload leg of a staged window. Zero or negative
+	// disables the upload term — the window then covers only session,
+	// envelope and hold, and an overrunning upload falls to finish-then-dot
+	// (correct, just later). Default 2 MB/s (see defaultUplinkRate).
+	UplinkRate int64
 
 	// MaxPayload is the largest accepted message payload: body bytes
 	// plus attachment bytes. Jobs above it are rejected at scheduling
@@ -210,12 +300,37 @@ func NewScheduler(store *Store) *Scheduler {
 		store:      store,
 		Courier:    RealCourier{},
 		WarmLead:   defaultWarmLead,
+		HoldBudget: defaultHoldBudget,
+		UplinkRate: defaultUplinkRate,
 		MaxPayload: defaultMaxPayload,
 		wake:       make(chan struct{}, 1),
 		runnerDone: make(chan struct{}, 1),
 		fatal:      make(chan error, 1),
 		active:     make(map[string]struct{}),
 	}
+}
+
+// stagedLead sizes one job's warm window: the time its runner needs to
+// open and authenticate a session (connectAuthBudget), run the lock-step
+// envelope (rcptBudget per recipient), stream the payload at the assumed
+// uplink rate, and then hold the dot for HoldBudget before FireAt. Only
+// jobs inside their window are handed off, so a provider session is held
+// no longer than this. WarmLead floors the result (short windows stay
+// as configured); WarmLead 0 means no warmup at all, hence no window.
+func (s *Scheduler) stagedLead(j Job) time.Duration {
+	if s.WarmLead <= 0 {
+		return 0
+	}
+	est := connectAuthBudget + time.Duration(len(j.Content.To))*rcptBudget
+	if s.UplinkRate > 0 {
+		payload := int64(len(j.Content.Body)) + attachmentBytes(j.Content.Attachments)
+		est += time.Duration(payload) * time.Second / time.Duration(s.UplinkRate)
+	}
+	lead := est + s.HoldBudget
+	if lead < s.WarmLead {
+		lead = s.WarmLead
+	}
+	return lead
 }
 
 // Schedule validates and persists a new job, then arms the run loop when
@@ -371,15 +486,17 @@ func (s *Scheduler) ScheduleWithID(id string, cfg mailer.MailConfig, content *ma
 
 	s.mu.Lock()
 	s.pending.Insert(job)
-	wasHead := s.pending[0].ID == job.ID
 	s.mu.Unlock()
-	if wasHead {
-		// The new job fires before everything else: hint the run loop to
-		// re-evaluate its head and re-arm on the new earliest deadline.
-		select {
-		case s.wake <- struct{}{}:
-		default:
-		}
+	// Always hint the loop, not only for a new head: warm windows are
+	// payload-aware, so a job deep in the queue can carry the EARLIEST
+	// window (a fat job opens long before a thin head) — the loop must
+	// re-evaluate the whole queue on every new pending job. The hint may
+	// drop; every consumer re-reads the authoritative queue after
+	// waking, so a dropped hint only delays the re-evaluation to the
+	// next one, never loses it.
+	select {
+	case s.wake <- struct{}{}:
+	default:
 	}
 
 	log.Printf("SCHEDULED job=%s msgid=%s to=%s fire=%s (in %s)",
@@ -410,7 +527,6 @@ func (s *Scheduler) replay(j Job) Job {
 	if arm {
 		s.pending.Insert(j)
 	}
-	wasHead := arm && s.pending[0].ID == j.ID
 	s.mu.Unlock()
 
 	if !arm {
@@ -418,11 +534,11 @@ func (s *Scheduler) replay(j Job) Job {
 			j.ID, j.MessageID, j.State)
 		return j
 	}
-	if wasHead {
-		select {
-		case s.wake <- struct{}{}:
-		default:
-		}
+	// Always hint (see ScheduleWithID): a re-armed job can carry the
+	// earliest warm window even when it is not the queue's head.
+	select {
+	case s.wake <- struct{}{}:
+	default:
 	}
 	log.Printf("SCHEDULED job=%s msgid=%s to=%s fire=%s (in %s) — idempotent replay: re-armed",
 		j.ID, j.MessageID, strings.Join(j.Content.To, ","),
@@ -555,40 +671,56 @@ func (s *Scheduler) run(ctx context.Context, serve bool, ready func()) error {
 			continue
 		}
 
-		head := s.pending[0]
+		// Hand-off decision, queue-wide: dispatch every job whose warm
+		// window has opened (or that is due). Windows are payload-aware
+		// (stagedLead), so a fat job deep in the queue can open long
+		// BEFORE the head's — a head-only loop would dispatch it late and
+		// shrink its hold into an overrun. Dispatching EAGERLY — rather
+		// than only while the window is still strictly in the future — is
+		// what lets every job sharing a deadline get its own warm session:
+		// under the old rule the loop handed the first job off at the
+		// window opening, then judged every follower — evaluated a
+		// microsecond later — "already past the window" and fired it cold
+		// at FireAt. Warmup is still skipped when too little time remains
+		// to finish it before the deadline (a job scheduled inside its
+		// window, or catching up) — decided from the remaining time, not
+		// from which side of the window edge the loop happens to be on.
 		now := time.Now()
-		// Hand-off decision: dispatch as soon as the warm window opens.
-		// Dispatching EAGERLY — rather than only when the window is still
-		// strictly in the future — is what lets every job sharing a
-		// deadline get its own warm session: under the old rule the loop
-		// handed the first job off at the window opening, then evaluated
-		// the second a microsecond later, judged it "already past the
-		// window" and fired it cold at FireAt. Warmup is still skipped
-		// when too little time remains to finish it before the deadline
-		// (a job scheduled inside its window, or catching up) — but that
-		// is decided from the remaining time, not from which side of the
-		// window edge the loop happens to be on.
-		windowStart := head.FireAt
-		if s.WarmLead > 0 {
-			windowStart = head.FireAt.Add(-s.WarmLead)
+		var nextWindow time.Time
+		dispatched := 0
+		for i := 0; i < len(s.pending); {
+			j := s.pending[i]
+			lead := s.stagedLead(j)
+			windowStart := j.FireAt
+			if lead > 0 {
+				windowStart = j.FireAt.Add(-lead)
+			}
+			windowOpen := lead > 0 && !now.Before(windowStart)
+			if windowOpen || !now.Before(j.FireAt) {
+				warm := lead > 0 && j.FireAt.Sub(now) >= min(minWarmBudget, lead/2)
+				s.pending = slices.Delete(s.pending, i, i+1)
+				s.active[j.ID] = struct{}{}
+				go s.runJob(j, warm)
+				dispatched++
+				continue // re-examine the slot: the queue shifted under it
+			}
+			if nextWindow.IsZero() || windowStart.Before(nextWindow) {
+				nextWindow = windowStart
+			}
+			i++
 		}
-		windowOpen := s.WarmLead > 0 && !now.Before(windowStart)
-		if windowOpen || !now.Before(head.FireAt) {
-			warm := s.WarmLead > 0 && head.FireAt.Sub(now) >= min(minWarmBudget, s.WarmLead/2)
-			s.pending = s.pending[1:]
-			s.active[head.ID] = struct{}{}
+		if dispatched > 0 {
 			s.mu.Unlock()
-			go s.runJob(head, warm)
-			continue
+			continue // re-scan: state may have changed while dispatching
 		}
 		s.mu.Unlock()
 
-		// The warm window has not opened yet: sleep until it does and
+		// No window is open yet: sleep until the earliest one does and
 		// re-evaluate. The wait is chunked and recomputed against the
 		// absolute instant (see maxArm); an earlier submission wakes it
 		// early to re-arm (the wake hint may drop, so every path re-reads
 		// the queue after waking).
-		if err := s.waitForUntil(ctx, windowStart); err != nil {
+		if err := s.waitForUntil(ctx, nextWindow); err != nil {
 			return s.stop(err)
 		}
 	}
@@ -618,10 +750,10 @@ func (s *Scheduler) drainRunners() {
 	}
 }
 
-// runJob owns one job from hand-off to its terminal state: warmup (when a
-// warm window was handed over), the chunked wait to the exact fire
-// instant, and the delivery. Single ownership is what preserves the
-// at-most-one-delivery-attempt discipline under concurrency.
+// runJob owns one job from hand-off to its terminal state: warmup and
+// staging (when a warm window was handed over), the chunked wait to the
+// exact fire instant, and the delivery. Single ownership is what preserves
+// the at-most-one-completed-delivery discipline under concurrency.
 func (s *Scheduler) runJob(j Job, warm bool) {
 	defer func() {
 		s.mu.Lock()
@@ -700,14 +832,18 @@ func (s *Scheduler) waitForUntil(ctx context.Context, until time.Time) error {
 	return nil
 }
 
-// prewarm moves everything except the delivery off the fire-time critical
-// path: message build, the crash-safety inflight persist (the fsync leaves
-// the critical window too), and the provider session (measured ~100-300ms
-// against the real provider).
+// prewarm moves everything except the delivery act off the fire-time
+// critical path: message build, the crash-safety inflight persist (the
+// fsync leaves the critical window too), the provider session (measured
+// ~100-300ms against the real provider), and — staging — the whole
+// transaction: envelope and full DATA upload, held ONE DOT short of
+// delivery (see Courier.Stage). At FireAt only the dot and the
+// provider's answer remain.
 //
-// Failures are best-effort: a session failure merely degrades the job to a
-// cold send at FireAt; only a prepare failure (the job can never be sent)
-// or a store failure terminates the job early.
+// Failures are best-effort — "just go": a session or staging failure
+// merely degrades the job to a cold send at FireAt; only a prepare
+// failure (the job can never be sent) or a store failure terminates the
+// job early.
 func (s *Scheduler) prewarm(j Job, st *warmState) error {
 	msg, err := s.Courier.Prepare(j.Config, &j.Content)
 	if err != nil {
@@ -737,14 +873,46 @@ func (s *Scheduler) prewarm(j Job, st *warmState) error {
 			time.Since(t0).Round(time.Millisecond),
 			time.Until(j.FireAt).Round(time.Millisecond))
 	}
+
+	// Staging ("hold the dot"): envelope + DATA + the full message go
+	// onto the fresh session NOW, leaving the transaction one dot short
+	// of delivery. A staged job's FIRE is the dot write — everything
+	// else already happened off the critical path. Failure degrades to
+	// a cold send at FireAt ("just go"): a staging error is pre-dot by
+	// construction (see StageOn), so nothing was delivered and nothing
+	// can be duplicated.
+	if st.session != nil {
+		t1 := time.Now()
+		st.staged, err = s.Courier.Stage(j.Config, st.session, st.msg, j.Content.To)
+		if err != nil {
+			s.Courier.Discard(st.session)
+			st.session, st.staged = nil, nil
+			log.Printf("WARM job=%s msgid=%s staging failed (%v): cold fallback at fire time",
+				j.ID, j.MessageID, err)
+		} else if st.staged != nil {
+			log.Printf("STAGED job=%s msgid=%s upload=%s (%s before fire; dot held)",
+				j.ID, j.MessageID,
+				time.Since(t1).Round(time.Millisecond),
+				time.Until(j.FireAt).Round(time.Millisecond))
+		}
+		// staged == nil with no error: the courier opted out of staging
+		// (the job delivers at the fire time over the warm session — the
+		// pre-staging behavior). Fakes use this; RealCourier never does.
+	}
 	return nil
 }
 
-// fire delivers one job, recording the full timing paper trail. It returns
-// an error only when the store itself failed BEFORE the send (a broken
-// store must stop the queue); send failures are recorded and reported,
-// not fatal, and a result that cannot be persisted is logged loudly
-// instead of failing the job.
+// fire delivers one job, recording the full timing paper trail. The
+// paths, per the "just go" policy (TODO.md item 6): a staged job writes
+// the dot — the delivery act — over its held transaction; a dot write
+// that fails left nothing on the wire, so exactly ONE cold full send
+// starts at the fire time, never later; a failure at or after the dot
+// wraps mailer.ErrDotOut and is TERMINAL (verify manually, never
+// re-attempted — a duplicate certified message is worse than a late
+// one). fire returns an error only when the store itself failed BEFORE
+// the send (a broken store must stop the queue); send failures are
+// recorded and reported, not fatal, and a result that cannot be persisted
+// is logged loudly instead of failing the job.
 func (s *Scheduler) fire(j Job, st *warmState) error {
 	now := time.Now()
 	lateness := now.Sub(j.FireAt)
@@ -767,35 +935,65 @@ func (s *Scheduler) fire(j Job, st *warmState) error {
 		if sess == nil {
 			cold = " (cold)"
 		}
+		// For a staged job this line stamps the DOT: the delivery act
+		// and the only thing that still had to happen at the fire time.
 		log.Printf("FIRE job=%s msgid=%s fired=%s lateness=%s%s",
 			j.ID, j.MessageID, stamp, lateness, cold)
 	}
 
-	// Cold path (no warm window existed): build and persist inflight here
-	// — still before any network I/O, as the crash-safety marker requires.
-	if msg == nil {
-		var err error
-		msg, err = s.Courier.Prepare(j.Config, &j.Content)
-		if err != nil {
-			if ferr := s.failNow(j, "prepare: "+err.Error()); ferr != nil {
-				return ferr
+	var sendErr error
+	var sendDur time.Duration
+	switch {
+	case st != nil && st.staged != nil:
+		// Staged: everything but the dot is already at the provider.
+		t0 := time.Now()
+		sendErr = s.Courier.Commit(j.Config, st.staged)
+		sendDur = time.Since(t0)
+		if sendErr != nil && !errors.Is(sendErr, mailer.ErrDotOut) {
+			// The dot never left the wire. "Just go": one cold full send
+			// starting NOW — at the fire time, never later, never an
+			// abandoned job. (An ErrDotOut error takes the other branch of
+			// the contract below: terminal, because the dot may have
+			// gone out.)
+			log.Printf("WARNING job=%s msgid=%s held transaction lost before the dot (%v): cold send at fire time",
+				j.ID, j.MessageID, sendErr)
+			t0 = time.Now()
+			sendErr = s.Courier.Send(j.Config, nil, msg, j.Content.To)
+			sendDur = time.Since(t0)
+		}
+	default:
+		// Cold path (no staged transaction): build and persist inflight
+		// here — still before any network I/O, as the crash-safety marker
+		// requires — then deliver, over the warm session when one exists
+		// (a courier that does not stage, or a staging failure).
+		if msg == nil {
+			prepared, err := s.Courier.Prepare(j.Config, &j.Content)
+			if err != nil {
+				if ferr := s.failNow(j, "prepare: "+err.Error()); ferr != nil {
+					return ferr
+				}
+				return errJobTerminal
 			}
-			return errJobTerminal
+			msg = prepared
+			j.State = StateInflight
+			if err := s.store.Update(j); err != nil {
+				return fmt.Errorf("jobber: persisting inflight state for job %s: %w", j.ID, err)
+			}
 		}
-		j.State = StateInflight
-		if err := s.store.Update(j); err != nil {
-			return fmt.Errorf("jobber: persisting inflight state for job %s: %w", j.ID, err)
-		}
+		t0 := time.Now()
+		sendErr = s.Courier.Send(j.Config, sess, msg, j.Content.To)
+		sendDur = time.Since(t0)
 	}
 
-	t0 := time.Now()
-	err := s.Courier.Send(j.Config, sess, msg, j.Content.To)
-	sendDur := time.Since(t0)
-
 	j.Result = &JobResult{FiredAt: now, Lateness: lateness, SendDuration: sendDur}
-	if err != nil {
+	if sendErr != nil {
 		j.State = StateFailed
-		j.Result.Err = err.Error()
+		j.Result.Err = sendErr.Error()
+		if errors.Is(sendErr, mailer.ErrDotOut) {
+			// The dot left the wire but the outcome is unknown — the same
+			// manual-verification rule as a crash during the send.
+			j.Result.Err += " — NOT auto-resent; verify the recipient inbox for the Message-ID"
+		}
 	} else {
 		j.State = StateSent
 	}
@@ -806,9 +1004,9 @@ func (s *Scheduler) fire(j Job, st *warmState) error {
 		log.Printf("CRITICAL job=%s send result could not be persisted: %v (next boot will mark it for manual verification)", j.ID, uerr)
 	}
 
-	if err != nil {
+	if sendErr != nil {
 		log.Printf("FAILED job=%s msgid=%s send=%s err=%v",
-			j.ID, j.MessageID, sendDur.Round(time.Millisecond), err)
+			j.ID, j.MessageID, sendDur.Round(time.Millisecond), sendErr)
 	} else {
 		log.Printf("SENT job=%s msgid=%s send=%s",
 			j.ID, j.MessageID, sendDur.Round(time.Millisecond))

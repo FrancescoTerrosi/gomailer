@@ -89,24 +89,37 @@ without ever re-creating it. `-list` works at any time (read-only):
 
 ## Timing — the strict constraint
 
-**Warmup** (`-lead`, default 5s): this long before the fire time the
-message is built, the crash-safety marker is persisted, and an
-authenticated provider session is opened (measured ~100–300ms against the
-real provider) — so at the fire time only the envelope/data round-trips
-remain. It is best-effort: if the provider is unreachable at warmup, or
-drops the warm session while waiting (detected with a NOOP liveness probe
-*before* any delivery command), the job degrades to a cold send at the
-fire time and never loses its deadline. At most one delivery is ever
-attempted per fire. `-lead 0` disables warmup entirely.
+**Warmup** (`-lead`, default 5s — the *floor* of a payload-aware
+window): this long before the fire time — earlier for fat payloads —
+the message is built, the crash-safety marker is persisted, an
+authenticated provider session is opened (measured ~100–300ms against
+the real provider), and the **whole transaction is staged**: envelope
+and full DATA upload streamed to the provider, then held **one dot
+short of delivery**. At the fire time only the terminating dot (five
+bytes, the delivery act) and the provider's answer remain — a fat send
+commits in one round-trip instead of one full upload. It is best-effort
+("just go"): if the provider is unreachable at warmup, staging fails,
+or the held transaction dies before the dot, the job degrades to a
+cold send at the fire time and never loses its deadline; an upload
+that overruns its window keeps streaming and the dot follows it
+(finish-then-dot, lateness = the overrun). Nothing observable exists
+before the dot — no queue entry, no accettanza, nothing
+recipient-visible (RFC 5321 §4.1.1.4) — so the no-early-deposit floor
+holds with the same causal proof. A failure *at or after the dot*
+(the answer lost) is terminal ambiguity: never auto-resent, verify the
+inbox for the Message-ID. At most one **completed** delivery (one dot)
+is ever attempted per fire. `-lead 0` disables warmup and staging
+entirely.
 
 **Concurrent firing**: the tending loop hands each job to its own runner
-when its warmup window opens (or when due); every runner owns its job
-end-to-end — build, session, exact-instant wait, delivery. Jobs that
-share a deadline fire **in parallel**, each over its own session, and a
-slow SMTP send can never delay another job's fire. Only jobs within
-`-lead` of their fire time are handed off, so concurrency costs one
+when its warm window opens (or when due); every runner owns its job
+end-to-end — build, session, staging, exact-instant wait, delivery. Jobs
+that share a deadline fire **in parallel**, each over its own session,
+and a slow SMTP send can never delay another job's fire. Only jobs
+inside their warm window are handed off, so concurrency costs one held
 session per imminent fire. A handed-off job is never re-queued: single
-ownership keeps the at-most-one-delivery discipline under concurrency.
+ownership keeps the at-most-one-completed-delivery discipline under
+concurrency.
 
 Timer re-arming is chunked (≤1s arms, each recomputed against the absolute
 deadline — the loop and every runner alike), so wake drift cannot

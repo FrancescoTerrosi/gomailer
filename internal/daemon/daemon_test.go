@@ -32,6 +32,16 @@ func (f *fakeCourier) Prepare(cfg mailer.MailConfig, c *mailer.MailContent) ([]b
 
 func (f *fakeCourier) Warm(cfg mailer.MailConfig) (any, error) { return nil, nil }
 
+// Stage returns nil (no staging): the daemon tests run cold (WarmLead=0),
+// so the warm path is never taken.
+func (f *fakeCourier) Stage(cfg mailer.MailConfig, session any, msg []byte, to []string) (any, error) {
+	return nil, nil
+}
+
+func (f *fakeCourier) Commit(cfg mailer.MailConfig, staged any) error {
+	return errors.New("fakeCourier: Commit must never be called (WarmLead=0 / Stage opts out)")
+}
+
 func (f *fakeCourier) Send(cfg mailer.MailConfig, session any, msg []byte, to []string) error {
 	f.mu.Lock()
 	f.sends = append(f.sends, msg)

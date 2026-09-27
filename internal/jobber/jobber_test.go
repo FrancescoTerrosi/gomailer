@@ -2,6 +2,7 @@ package jobber
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,6 +43,12 @@ func testContent(body string) mailer.MailContent {
 // warmToken is the fake session returned by a successful fakeCourier.Warm.
 type warmToken struct{}
 
+// stagedToken is the fake held transaction returned by a successful
+// fakeCourier.Stage when staging is enabled (staged == nil means the
+// courier opts out: the job then delivers cold over the warm session,
+// the pre-staging behavior).
+type stagedToken struct{}
+
 type sendCall struct {
 	at      time.Time
 	session any
@@ -55,9 +62,14 @@ type fakeCourier struct {
 	mu         sync.Mutex
 	prepareErr error
 	warmErr    error
+	stageErr   error
 	sendErr    error
+	commitErr  error
+	staged     any // nil = opt out of staging (pre-staging behavior)
 	prepares   []time.Time
 	warms      []time.Time
+	stages     []time.Time
+	commits    []time.Time
 	sends      []sendCall
 }
 
@@ -76,6 +88,23 @@ func (f *fakeCourier) Warm(cfg mailer.MailConfig) (any, error) {
 		return nil, f.warmErr
 	}
 	return &warmToken{}, nil
+}
+
+func (f *fakeCourier) Stage(cfg mailer.MailConfig, session any, msg []byte, to []string) (any, error) {
+	f.mu.Lock()
+	f.stages = append(f.stages, time.Now())
+	f.mu.Unlock()
+	if f.stageErr != nil {
+		return nil, f.stageErr
+	}
+	return f.staged, nil
+}
+
+func (f *fakeCourier) Commit(cfg mailer.MailConfig, staged any) error {
+	f.mu.Lock()
+	f.commits = append(f.commits, time.Now())
+	f.mu.Unlock()
+	return f.commitErr
 }
 
 func (f *fakeCourier) Send(cfg mailer.MailConfig, session any, msg []byte, to []string) error {
@@ -880,5 +909,306 @@ func TestColdJobDoesNotShadowFollowers(t *testing.T) {
 	}
 	if _, ok := c.sends[2].session.(*warmToken); !ok || string(c.sends[2].msg) != "C" {
 		t.Fatalf("C must fire warm: msg=%q session=%v", c.sends[2].msg, c.sends[2].session)
+	}
+}
+
+// --- Staged delivery: hold the dot, "just go" (TODO.md item 6) ---
+
+// TestStagedCommitFiresAtDeadline: a warmed job stages its whole
+// transaction early, then holds the dot and commits it AT the fire time —
+// the Send path is never taken, and the staging happened off the critical
+// path (well before the deadline).
+func TestStagedCommitFiresAtDeadline(t *testing.T) {
+	store := testStore(t)
+	s := NewScheduler(store)
+	c := &fakeCourier{staged: &stagedToken{}}
+	s.Courier = c
+	fireAt := time.Now().Add(2500 * time.Millisecond)
+
+	content := testContent("hold the dot")
+	if _, err := s.Schedule(testConfig(), &content, fireAt); err != nil {
+		t.Fatalf("Schedule: %v", err)
+	}
+	if err := s.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.warms) != 1 || len(c.stages) != 1 || len(c.commits) != 1 {
+		t.Fatalf("warms=%d stages=%d commits=%d, want 1/1/1", len(c.warms), len(c.stages), len(c.commits))
+	}
+	if len(c.sends) != 0 {
+		t.Fatalf("sends = %d, want 0 (a staged job commits the dot; it never takes the cold Send path)", len(c.sends))
+	}
+	if lateness := c.commits[0].Sub(fireAt); lateness < 0 || lateness > 500*time.Millisecond {
+		t.Fatalf("dot committed %v off the deadline, want 0..500ms", lateness)
+	}
+	// The whole transaction was at the provider well before the fire
+	// time: staging ran off the critical path.
+	if early := fireAt.Sub(c.stages[0]); early < time.Second {
+		t.Fatalf("staged only %v before fire, want >= 1s (off the critical path)", early)
+	}
+
+	jobs, _ := store.Load()
+	if jobs[0].State != StateSent || jobs[0].Result == nil || jobs[0].Result.Err != "" {
+		t.Fatalf("result = %+v, want a clean sent", jobs[0].Result)
+	}
+}
+
+// TestStagedDotOutIsTerminalNeverResent: a commit whose dot left the wire
+// but whose answer was lost is TERMINAL ambiguity — recorded failed with
+// the manual-verification rule, and never retried (a second attempt could
+// duplicate a certified send).
+func TestStagedDotOutIsTerminalNeverResent(t *testing.T) {
+	store := testStore(t)
+	s := NewScheduler(store)
+	c := &fakeCourier{staged: &stagedToken{}, commitErr: fmt.Errorf("%w: reading the answer: EOF", mailer.ErrDotOut)}
+	s.Courier = c
+
+	content := testContent("ambiguous dot")
+	// >= 1s out: inside the warm budget, so the job stages and commits.
+	if _, err := s.Schedule(testConfig(), &content, time.Now().Add(1200*time.Millisecond)); err != nil {
+		t.Fatalf("Schedule: %v", err)
+	}
+	if err := s.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.commits) != 1 {
+		t.Fatalf("commits = %d, want exactly 1", len(c.commits))
+	}
+	if len(c.sends) != 0 {
+		t.Fatalf("sends = %d, want 0 (an uncertain dot must never be re-attempted)", len(c.sends))
+	}
+	jobs, _ := store.Load()
+	if jobs[0].State != StateFailed || jobs[0].Result == nil {
+		t.Fatalf("state = %q, want failed", jobs[0].State)
+	}
+	if err := jobs[0].Result.Err; !strings.Contains(err, "NOT auto-resent") || !strings.Contains(err, "verify the recipient inbox") {
+		t.Fatalf("the ambiguity must carry the manual-verification rule: %q", err)
+	}
+}
+
+// TestStagingFailureFiresColdAtDeadline: a staging failure is pre-dot by
+// construction — discard the session, deliver cold at the fire time
+// ("just go"), never late by more than the fallback itself.
+func TestStagingFailureFiresColdAtDeadline(t *testing.T) {
+	store := testStore(t)
+	s := NewScheduler(store)
+	c := &fakeCourier{stageErr: errors.New("upload died")}
+	s.Courier = c
+	fireAt := time.Now().Add(2 * time.Second)
+
+	content := testContent("cold after staging")
+	if _, err := s.Schedule(testConfig(), &content, fireAt); err != nil {
+		t.Fatalf("Schedule: %v", err)
+	}
+	if err := s.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.warms) != 1 || len(c.stages) != 1 {
+		t.Fatalf("warms=%d stages=%d, want 1/1 (staging was attempted)", len(c.warms), len(c.stages))
+	}
+	if len(c.sends) != 1 || c.sends[0].session != nil {
+		t.Fatalf("sends = %d (session=%v), want exactly one COLD send over a discarded session", len(c.sends), c.sends[0].session)
+	}
+	if lateness := c.sends[0].at.Sub(fireAt); lateness < 0 || lateness > 500*time.Millisecond {
+		t.Fatalf("cold fallback lateness = %v, want 0..500ms", lateness)
+	}
+	jobs, _ := store.Load()
+	if jobs[0].State != StateSent {
+		t.Fatalf("state = %q, want sent", jobs[0].State)
+	}
+}
+
+// TestCommitDotWriteFailureFallsBackCold: a held transaction lost BEFORE
+// the dot (reset connection, truncated record) left nothing on the wire —
+// "just go" sends cold at the fire time, exactly once.
+func TestCommitDotWriteFailureFallsBackCold(t *testing.T) {
+	store := testStore(t)
+	s := NewScheduler(store)
+	c := &fakeCourier{staged: &stagedToken{}, commitErr: errors.New("connection reset by peer")}
+	s.Courier = c
+	fireAt := time.Now().Add(2 * time.Second)
+
+	content := testContent("held, then lost")
+	if _, err := s.Schedule(testConfig(), &content, fireAt); err != nil {
+		t.Fatalf("Schedule: %v", err)
+	}
+	if err := s.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.commits) != 1 || len(c.sends) != 1 {
+		t.Fatalf("commits=%d sends=%d, want 1/1 (one failed dot attempt, one cold send)", len(c.commits), len(c.sends))
+	}
+	if c.sends[0].session != nil {
+		t.Fatal("the fallback must be cold: the held session is dead")
+	}
+	if lateness := c.sends[0].at.Sub(fireAt); lateness < 0 || lateness > 500*time.Millisecond {
+		t.Fatalf("fallback lateness = %v, want 0..500ms (it starts AT the fire time)", lateness)
+	}
+	jobs, _ := store.Load()
+	if jobs[0].State != StateSent {
+		t.Fatalf("state = %q, want sent", jobs[0].State)
+	}
+}
+
+// overrunningCourier simulates an upload that overruns the fire time:
+// Stage blocks until released, past the deadline. "Just go" then demands
+// finish-then-dot: exactly one commit, after staging completes — never an
+// abandoned upload, never a second attempt.
+type overrunningCourier struct {
+	mu      sync.Mutex
+	stages  []time.Time
+	commits []time.Time
+	sends   []sendCall
+	release chan struct{}
+}
+
+func (c *overrunningCourier) Prepare(cfg mailer.MailConfig, ct *mailer.MailContent) ([]byte, error) {
+	return []byte(ct.Body), nil
+}
+func (c *overrunningCourier) Warm(cfg mailer.MailConfig) (any, error) { return &warmToken{}, nil }
+func (c *overrunningCourier) Stage(cfg mailer.MailConfig, session any, msg []byte, to []string) (any, error) {
+	c.mu.Lock()
+	c.stages = append(c.stages, time.Now())
+	c.mu.Unlock()
+	<-c.release // the "upload" keeps streaming past FireAt
+	return &stagedToken{}, nil
+}
+func (c *overrunningCourier) Commit(cfg mailer.MailConfig, staged any) error {
+	c.mu.Lock()
+	c.commits = append(c.commits, time.Now())
+	c.mu.Unlock()
+	return nil
+}
+func (c *overrunningCourier) Send(cfg mailer.MailConfig, session any, msg []byte, to []string) error {
+	c.mu.Lock()
+	c.sends = append(c.sends, sendCall{at: time.Now(), session: session, msg: msg})
+	c.mu.Unlock()
+	return nil
+}
+func (c *overrunningCourier) Discard(session any) {}
+
+func TestStagedOverrunFinishThenDot(t *testing.T) {
+	store := testStore(t)
+	s := NewScheduler(store)
+	c := &overrunningCourier{release: make(chan struct{})}
+	s.Courier = c
+	fireAt := time.Now().Add(2 * time.Second)
+
+	content := testContent("fat upload")
+	if _, err := s.Schedule(testConfig(), &content, fireAt); err != nil {
+		t.Fatalf("Schedule: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.Run() }()
+
+	// Let the deadline pass mid-upload, then let the upload finish.
+	time.Sleep(time.Until(fireAt) + 300*time.Millisecond)
+	close(c.release)
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.commits) != 1 || len(c.sends) != 0 {
+		t.Fatalf("commits=%d sends=%d, want 1/0 (finish-then-dot, never an abandoned upload)", len(c.commits), len(c.sends))
+	}
+	if d := c.commits[0].Sub(fireAt); d < 250*time.Millisecond {
+		t.Fatalf("commit %v after fire; want the overrun (~300ms) — never an early dot", d)
+	}
+	jobs, _ := store.Load()
+	if jobs[0].State != StateSent || jobs[0].Result == nil || jobs[0].Result.Lateness < 250*time.Millisecond {
+		t.Fatalf("result = %+v, want sent with the overrun recorded as lateness", jobs[0].Result)
+	}
+}
+
+// TestStagedWindowIsPayloadAware: warm windows are per job. With the hold
+// budget zeroed and a slow assumed uplink, the fat job's window opens
+// long before the tiny one's — the tending loop must dispatch (and
+// stage) the fat job FIRST even though FIFO order puts the tiny job at
+// the head of the queue.
+func TestStagedWindowIsPayloadAware(t *testing.T) {
+	store := testStore(t)
+	s := NewScheduler(store)
+	s.HoldBudget = 0         // windows = pure staging estimate
+	s.UplinkRate = 1000      // 1 kB/s: the fat upload dominates its window
+	s.WarmLead = time.Second // the floor for the tiny job
+	c := &fakeCourier{staged: &stagedToken{}}
+	s.Courier = c
+
+	t0 := time.Now()
+	fireAt := t0.Add(4 * time.Second)
+	tiny := testContent("tiny") // ~1s window: session + one RTT
+	if _, err := s.Schedule(testConfig(), &tiny, fireAt); err != nil {
+		t.Fatalf("Schedule tiny: %v", err)
+	}
+	fat := testContent(strings.Repeat("x", 6000))
+	fat.Attachments = []mailer.Attachment{{Filename: "fat.bin", ContentType: "application/octet-stream", Data: make([]byte, 4000)}}
+	if _, err := s.Schedule(testConfig(), &fat, fireAt); err != nil { // ~11s window
+		t.Fatalf("Schedule fat: %v", err)
+	}
+	if err := s.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.stages) != 2 || len(c.commits) != 2 {
+		t.Fatalf("stages=%d commits=%d, want 2/2", len(c.stages), len(c.commits))
+	}
+	fatStage, tinyStage := c.stages[0], c.stages[1]
+	if fatStage.Sub(t0) > 800*time.Millisecond {
+		t.Fatalf("the fat job staged %v after start; its larger window must open immediately", fatStage.Sub(t0))
+	}
+	if tinyStage.Sub(t0) < 1500*time.Millisecond {
+		t.Fatalf("the tiny job staged %v after start; its ~1s window must not open before ~3s", tinyStage.Sub(t0))
+	}
+	for i, cm := range c.commits {
+		if d := cm.Sub(fireAt); d < 0 || d > 500*time.Millisecond {
+			t.Fatalf("commit %d landed %v off the deadline", i, d)
+		}
+	}
+}
+
+// TestWarmLeadZeroDisablesStaging: warmup disabled means no window, no
+// session, no staging — every job fires cold, exactly as before.
+func TestWarmLeadZeroDisablesStaging(t *testing.T) {
+	store := testStore(t)
+	s := NewScheduler(store)
+	c := &fakeCourier{staged: &stagedToken{}}
+	s.WarmLead = 0
+	s.Courier = c
+
+	content := testContent("no warmup")
+	if _, err := s.Schedule(testConfig(), &content, time.Now().Add(200*time.Millisecond)); err != nil {
+		t.Fatalf("Schedule: %v", err)
+	}
+	if err := s.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.stages) != 0 || len(c.commits) != 0 {
+		t.Fatalf("stages=%d commits=%d, want 0/0 (WarmLead=0 disables the warm path entirely)", len(c.stages), len(c.commits))
+	}
+	if len(c.sends) != 1 {
+		t.Fatalf("sends = %d, want 1 (cold)", len(c.sends))
+	}
+	jobs, _ := store.Load()
+	if jobs[0].State != StateSent {
+		t.Fatalf("state = %q, want sent", jobs[0].State)
 	}
 }

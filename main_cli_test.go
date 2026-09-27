@@ -23,6 +23,14 @@ func (nopCourier) Prepare(cfg mailer.MailConfig, c *mailer.MailContent) ([]byte,
 	return []byte(c.Body), nil
 }
 func (nopCourier) Warm(cfg mailer.MailConfig) (any, error) { return nil, nil }
+
+// nopCourier's Stage returns nil (no staging): the CLI tests run cold.
+func (nopCourier) Stage(cfg mailer.MailConfig, session any, msg []byte, to []string) (any, error) {
+	return nil, nil
+}
+func (nopCourier) Commit(cfg mailer.MailConfig, staged any) error {
+	return nil
+}
 func (nopCourier) Send(cfg mailer.MailConfig, session any, msg []byte, to []string) error {
 	return nil
 }

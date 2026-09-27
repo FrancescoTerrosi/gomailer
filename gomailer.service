@@ -4,8 +4,7 @@
 #   go build -o gomailer .
 #   sudo install -m755 gomailer /usr/local/bin/gomailer
 #   sudo install -m644 gomailer.service /etc/systemd/system/gomailer.service
-#   sudo install -d -m755 /etc/sysusers.d            # not shipped by Ubuntu/Debian
-#   sudo install -m644 gomailer.sysusers.conf /etc/sysusers.d/gomailer.conf
+#   sudo install -D -m644 gomailer.sysusers.conf /etc/sysusers.d/gomailer.conf
 #   sudo systemd-sysusers                # creates the gomailer user/group
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now gomailer

@@ -33,6 +33,16 @@ func (f *slowSendCourier) Prepare(cfg mailer.MailConfig, c *mailer.MailContent) 
 
 func (f *slowSendCourier) Warm(cfg mailer.MailConfig) (any, error) { return nil, nil }
 
+// Stage returns nil (no staging): this courier exercises the cold path,
+// where Send's own duration proves concurrency.
+func (f *slowSendCourier) Stage(cfg mailer.MailConfig, session any, msg []byte, to []string) (any, error) {
+	return nil, nil
+}
+
+func (f *slowSendCourier) Commit(cfg mailer.MailConfig, staged any) error {
+	return errors.New("slowSendCourier: Commit must never be called (Stage opts out)")
+}
+
 func (f *slowSendCourier) Send(cfg mailer.MailConfig, session any, msg []byte, to []string) error {
 	f.mu.Lock()
 	f.sends = append(f.sends, sendCall{at: time.Now(), session: session, msg: msg})
@@ -58,6 +68,79 @@ func waitSends(t *testing.T, c *fakeCourier, want int, timeout time.Duration) {
 			t.Fatalf("send calls = %d, want %d", n, want)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// waitStages polls a fake courier until want stagings were recorded.
+func waitStages(t *testing.T, c *fakeCourier, want int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		c.mu.Lock()
+		n := len(c.stages)
+		c.mu.Unlock()
+		if n >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stage calls = %d, want %d", n, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestServeStopWaitsForHeldRunner: a runner holding a staged dot is
+// committed — a graceful stop waits for it, and the dot lands at the
+// fire time, never earlier (a stop must not pull the delivery act
+// forward: the no-early-deposit floor holds across shutdown).
+func TestServeStopWaitsForHeldRunner(t *testing.T) {
+	store := testStore(t)
+	s := NewScheduler(store)
+	c := &fakeCourier{staged: &stagedToken{}}
+	s.Courier = c
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ready := make(chan struct{})
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- s.Serve(ctx, func() { close(ready) })
+	}()
+	<-ready
+
+	fireAt := time.Now().Add(1200 * time.Millisecond)
+	content := testContent("held across the stop")
+	if _, err := s.Schedule(testConfig(), &content, fireAt); err != nil {
+		t.Fatalf("Schedule: %v", err)
+	}
+
+	// Wait until the transaction is staged (the hold), then stop.
+	waitStages(t, c, 1, 3*time.Second)
+	cancel()
+
+	select {
+	case err := <-serveErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Serve returned %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not drain: the held runner must finish its commit")
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.commits) != 1 {
+		t.Fatalf("commits = %d, want 1 (the stop must not abandon the committed runner)", len(c.commits))
+	}
+	if d := c.commits[0].Sub(fireAt); d < 0 {
+		t.Fatal("the dot was written BEFORE the fire time — a stop must never pull it early")
+	}
+	if len(c.sends) != 0 {
+		t.Fatalf("sends = %d, want 0", len(c.sends))
+	}
+	jobs, _ := store.Load()
+	if jobs[0].State != StateSent {
+		t.Fatalf("state = %q, want sent", jobs[0].State)
 	}
 }
 
