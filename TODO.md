@@ -315,6 +315,16 @@ holding the terminating dot. The prefire prohibition applies to
   (finish-then-dot on overrun, cold full send at the fire time when the dot
   write fails, terminal verify when the dot left). Logged `STAGED upload=…`
   is the uplink baseline item 5 wants.
+- `StageOn` CONSUMES the session on failure (closes it): a failed staging
+  leaves a half-open envelope — and, from DATA on, an abandoned dot-writer
+  that textproto auto-closes (writes the DOT) on the next command — so
+  closing makes the "probe the leftover session" misuse impossible; the
+  caller's fallback — close and retry with one cold full send — is the
+  only move left (`TestStageFailureConsumesSession`).
+- `fire` stamps `FiredAt`/`Lateness`/`SendDuration` on the delivery
+  attempt that produced the outcome: on the "just go" fallback the dead
+  held transaction's cost now lands in the recorded lateness (and the
+  WARNING log) instead of vanishing (`TestFallbackStampCarriesTheLostHold`).
 
 **Still pending before it runs against the certified provider**: the live
 held-dot probe (the item-1 discipline — no wire-behavior change without

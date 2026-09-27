@@ -45,6 +45,9 @@ func shortBudgets(t *testing.T, d time.Duration) {
 //	"hang"        — never answer: the client's 250 read must time out
 //	"close-data"  — vanish right after the 354, mid-upload
 //	"hang-hello"  — accept the connection and send nothing at all
+//	"bad-rcpt"    — refuse the FIRST RCPT, accept later ones: a staging
+//	                failure over a still-alive connection (the cold retry
+//	                then succeeds, so the session's fate is the client's)
 type fakePECServer struct {
 	mu        sync.Mutex
 	behavior  string
@@ -55,6 +58,7 @@ type fakePECServer struct {
 	tlsConf   *tls.Config // for the STARTTLS upgrade
 	t         *testing.T
 	closeOnce sync.Once
+	rcptSeen  bool // "bad-rcpt": the first RCPT was refused already
 }
 
 func startFakePEC(t *testing.T, behavior string) *fakePECServer {
@@ -119,6 +123,18 @@ func (s *fakePECServer) kill() {
 		}
 		c.Close()
 	}
+}
+
+// firstRcpt consumes the "refuse once" token of the "bad-rcpt" behavior:
+// true exactly for the first RCPT the server ever sees.
+func (s *fakePECServer) firstRcpt() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rcptSeen {
+		return false
+	}
+	s.rcptSeen = true
+	return true
 }
 
 // snapshot copies the recorded state for assertions.
@@ -197,7 +213,11 @@ func (s *fakePECServer) handle(conn net.Conn) {
 		case strings.HasPrefix(strings.ToUpper(cmd), "MAIL"):
 			line("250 ok")
 		case strings.HasPrefix(strings.ToUpper(cmd), "RCPT"):
-			line("250 ok")
+			if behavior == "bad-rcpt" && s.firstRcpt() {
+				line("550 no such recipient")
+			} else {
+				line("250 ok")
+			}
 		case strings.HasPrefix(strings.ToUpper(cmd), "NOOP"):
 			if behavior == "bad-noop" {
 				line("500 no") // a probe failure on a LIVE connection: SendOn must discard and reconnect
@@ -392,15 +412,64 @@ func TestHeldSessionKilledDuringHoldFallsBackSafe(t *testing.T) {
 
 // TestStageUploadFailureIsPreDot: the provider vanishing mid-upload is a
 // staging failure — pre-dot by construction, never ErrDotOut.
+//
+// The message is deliberately FAT (≫ any kernel socket buffer): the
+// flush of a small message can complete into local buffers before the
+// reset is processed — a TCP race the test must not depend on — while a
+// fat one cannot, so the upload failure is guaranteed by two
+// independent mechanisms (the reset arriving mid-write, and the
+// buffers filling against a peer that no longer reads).
 func TestStageUploadFailureIsPreDot(t *testing.T) {
 	srv := startFakePEC(t, "close-data")
+	cfg := srv.config()
+	sess, _, content := stageFixture(t, cfg)
+
+	content.Body = strings.Repeat("upload payload line\r\n", 8*65536) // ≈ 9.4 MB
+	fat, err := cfg.Prepare(&content)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	if _, err := cfg.StageOn(sess, fat, content.To); err == nil {
+		t.Fatal("an upload to a vanished provider must fail")
+	} else if errors.Is(err, ErrDotOut) {
+		t.Fatalf("staging failure must be pre-dot, got: %v", err)
+	}
+}
+
+// TestStageFailureConsumesSession: ANY staging failure must close the
+// session (see StageOn). The refusal arrives over a still-alive
+// connection, so the next command WOULD run if the session were left
+// open — and a leftover session with a half-open envelope, or an
+// abandoned dot-writer, turns the next command into a possible early
+// commit (textproto auto-closes a pending dot-writer). The NOOP failing
+// here proves the failure itself consumed the session — and the "just
+// go" retry then works cold, over a fresh connection.
+func TestStageFailureConsumesSession(t *testing.T) {
+	srv := startFakePEC(t, "bad-rcpt")
 	cfg := srv.config()
 	sess, msg, content := stageFixture(t, cfg)
 
 	if _, err := cfg.StageOn(sess, msg, content.To); err == nil {
-		t.Fatal("an upload to a vanished provider must fail")
+		t.Fatal("staging against a recipient-refusing provider must fail")
 	} else if errors.Is(err, ErrDotOut) {
-		t.Fatalf("staging failure must be pre-dot, got: %v", err)
+		t.Fatalf("a staging failure is pre-dot by construction, got: %v", err)
+	}
+	// The session must be dead: no command may ever run on it again.
+	if err := sess.client.Noop(); err == nil {
+		t.Fatal("the failed staging left a live session — StageOn must consume it (the next command could auto-write the dot)")
+	}
+	// "Just go": the retry is a cold full send over a FRESH session —
+	// the consumed one is worthless by construction.
+	if err := cfg.SendOn(sess, msg, content.To); err != nil {
+		t.Fatalf("SendOn must retry cold past the consumed session: %v", err)
+	}
+	dotAt, dataLen := srv.snapshot()
+	if dotAt.IsZero() {
+		t.Fatal("the cold retry never delivered (no dot at the server)")
+	}
+	if dataLen != len(msg) {
+		t.Fatalf("delivered bytes = %d, want %d", dataLen, len(msg))
 	}
 }
 

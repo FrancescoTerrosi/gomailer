@@ -32,11 +32,15 @@ const (
 // persisted together with the terminal state as a timing paper trail for
 // human-side verification.
 type JobResult struct {
-	// FiredAt is the instant the SMTP send actually began.
+	// FiredAt is the instant the delivery attempt began: the Commit
+	// (whose first wire act is the dot) for a staged job, the wake
+	// instant for a cold job — and, on the "just go" fallback, the cold
+	// send that actually delivered.
 	FiredAt time.Time
-	// Lateness is how much later than FireAt the send began (>= 0).
-	// Non-zero lateness means catch-up: the process/machine was not
-	// running at FireAt.
+	// Lateness is how much later than FireAt the delivery attempt began
+	// (>= 0). Non-zero lateness means catch-up — the process/machine was
+	// not running at FireAt — or, for a fallback send, the time the dead
+	// held transaction consumed before the cold retry began.
 	Lateness time.Duration
 	// SendDuration is the wall-clock length of the SMTP session.
 	SendDuration time.Duration

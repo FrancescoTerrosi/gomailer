@@ -119,7 +119,10 @@ func (c MailConfig) Prepare(content *MailContent) ([]byte, error) {
 // Sessions exist so connection setup can be moved off the fire-time
 // critical path (warmup). They are safe to hold only for short leads;
 // their liveness is re-probed (NOOP) before any delivery command when
-// they had time to idle.
+// they had time to idle. A session is CONSUMED by its delivery path:
+// StageOn either hands it to the returned Staged (whose Commit closes
+// it) or closes it on failure — a session that entered a delivery
+// attempt must never accept an unrelated command again (see StageOn).
 type Session struct {
 	client *smtp.Client
 	// conn is the transport under the client, carrying the sliding
@@ -181,16 +184,35 @@ type Staged struct {
 // Staged). The transport deadline is cleared at the end: the hold is
 // deliberate idle time, and Commit re-arms it.
 //
+// The session is CONSUMED either way: success hands it to the returned
+// Staged (whose Commit closes it); ANY failure closes it here. That is
+// defense in depth for a textproto trap: a staging failure leaves the
+// session with a half-open envelope — and, from the DATA step on, an
+// abandoned dot-writer — and textproto auto-closes a pending dot-writer
+// when the next command is written (PrintfLine → closeDot), so a NOOP
+// "liveness probe" against the leftover session would write the DOT
+// and commit a partial message early. A closed session makes that
+// misuse impossible: the caller's one safe move — close and retry with
+// a single cold full send ("just go") — becomes the only move. Close is
+// idempotent, so an extra Discard on the failed session is harmless.
+//
 // The caller guarantees a live session: the scheduler stages immediately
 // after warming (no idle gap), and SendOn probes first (a session that
 // had time to idle is detected — and replaced cold — BEFORE any delivery
 // command; NOOP has no delivery semantics). Every failure here precedes
 // the dot by construction, hence is never ambiguous: the caller may
 // safely fall back to a cold full send at the fire time ("just go").
-func (c MailConfig) StageOn(sess *Session, msg []byte, to []string) (*Staged, error) {
+func (c MailConfig) StageOn(sess *Session, msg []byte, to []string) (st *Staged, err error) {
 	if sess == nil || sess.client == nil {
 		return nil, errors.New("mailer: staging needs a live session")
 	}
+	// A session that failed to stage must never accept another command
+	// (see the contract above).
+	defer func() {
+		if err != nil {
+			sess.Close()
+		}
+	}()
 	// Envelope sender is the certified address.
 	if err := sess.client.Mail(c.Username); err != nil {
 		return nil, fmt.Errorf("mailer: mail from: %w", err)
@@ -284,7 +306,8 @@ func (st *Staged) Commit() error {
 // SendOn delivers a prepared message over the given session, then closes
 // it — the cold path: everything, including the dot, happens back to
 // back at the fire time. It is the composition StageOn + Commit with a
-// zero-length hold.
+// zero-length hold, and it consumes the session on every path: StageOn
+// closes it on failure (see its contract), Commit on success.
 //
 // A nil session — or one whose NOOP liveness probe fails (the probe runs
 // BEFORE any delivery command; NOOP has no delivery semantics) — makes
@@ -307,8 +330,7 @@ func (c MailConfig) SendOn(sess *Session, msg []byte, to []string) error {
 	}
 	staged, err := c.StageOn(sess, msg, to)
 	if err != nil {
-		sess.Close()
-		return err
+		return err // StageOn already consumed (closed) the failed session
 	}
 	return staged.Commit()
 }

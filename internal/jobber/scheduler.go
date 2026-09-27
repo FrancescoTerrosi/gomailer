@@ -36,10 +36,13 @@ type Courier interface {
 	// the transaction ONE DOT short of delivery. It is called immediately
 	// after Warm (no idle gap to probe). The returned handle is opaque;
 	// nil means "not staged" — the job then delivers at the fire time over
-	// the warm session, exactly as before staging existed. Every Stage
-	// failure precedes the dot by construction, so the caller must
-	// degrade to a cold send at the fire time ("just go"), never abandon
-	// the job.
+	// the warm session, exactly as before staging existed. The session is
+	// consumed either way (RealCourier's StageOn closes it on failure: a
+	// session that failed to stage must never accept another command, see
+	// mailer.StageOn — so a Discard after a failed Stage is idempotent,
+	// kept for couriers that release lazily). Every Stage failure precedes
+	// the dot by construction, so the caller must degrade to a cold send
+	// at the fire time ("just go"), never abandon the job.
 	Stage(cfg mailer.MailConfig, session any, msg []byte, to []string) (any, error)
 	// Commit performs the delivery act (the terminating dot) and reads
 	// the provider's answer; call it at or after the fire time, exactly
@@ -885,7 +888,7 @@ func (s *Scheduler) prewarm(j Job, st *warmState) error {
 		t1 := time.Now()
 		st.staged, err = s.Courier.Stage(j.Config, st.session, st.msg, j.Content.To)
 		if err != nil {
-			s.Courier.Discard(st.session)
+			s.Courier.Discard(st.session) // idempotent: the failed Stage consumed it (see Courier.Stage)
 			st.session, st.staged = nil, nil
 			log.Printf("WARM job=%s msgid=%s staging failed (%v): cold fallback at fire time",
 				j.ID, j.MessageID, err)
@@ -913,13 +916,21 @@ func (s *Scheduler) prewarm(j Job, st *warmState) error {
 // the send (a broken store must stop the queue); send failures are
 // recorded and reported, not fatal, and a result that cannot be persisted
 // is logged loudly instead of failing the job.
+//
+// The timing stamps (FiredAt/Lateness/SendDuration) bracket the
+// delivery attempt that produced the outcome: the Commit for a staged
+// job (its first wire act is the dot, so FiredAt IS the dot time), the
+// wake instant for a cold job — the drift observable the record pins.
+// On the "just go" fallback the stamp MOVES to the cold send that
+// actually delivered, so the dead held transaction's cost lands in
+// Lateness, never in silence.
 func (s *Scheduler) fire(j Job, st *warmState) error {
-	now := time.Now()
-	lateness := now.Sub(j.FireAt)
-	if lateness < 0 {
-		lateness = 0
+	started := time.Now()
+	enteredLate := started.Sub(j.FireAt)
+	if enteredLate < 0 {
+		enteredLate = 0
 	}
-	stamp := now.Format("2006-01-02 15:04:05.000000 -0700")
+	stamp := started.Format("2006-01-02 15:04:05.000000 -0700")
 
 	var msg []byte
 	var sess any
@@ -927,9 +938,9 @@ func (s *Scheduler) fire(j Job, st *warmState) error {
 		msg, sess = st.msg, st.session
 	}
 
-	if lateness >= catchupWarn {
+	if enteredLate >= catchupWarn {
 		log.Printf("WARNING job=%s msgid=%s FIRED %s LATE (process/machine was not running at the fire time) fired=%s",
-			j.ID, j.MessageID, lateness.Round(time.Millisecond), stamp)
+			j.ID, j.MessageID, enteredLate.Round(time.Millisecond), stamp)
 	} else {
 		cold := ""
 		if sess == nil {
@@ -938,28 +949,36 @@ func (s *Scheduler) fire(j Job, st *warmState) error {
 		// For a staged job this line stamps the DOT: the delivery act
 		// and the only thing that still had to happen at the fire time.
 		log.Printf("FIRE job=%s msgid=%s fired=%s lateness=%s%s",
-			j.ID, j.MessageID, stamp, lateness, cold)
+			j.ID, j.MessageID, stamp, enteredLate, cold)
 	}
 
+	// firedAt stamps the delivery attempt that produced the outcome (see
+	// JobResult.FiredAt): the Commit for a staged job — its first wire act
+	// is the dot, so firedAt IS the dot time — and the wake instant for a
+	// cold job (the record's drift observable: nothing else pins the wake
+	// decision). On the "just go" fallback the stamp MOVES to the cold
+	// send's start, so Lateness carries the time the dead held transaction
+	// consumed instead of silently dropping it.
+	firedAt := started
 	var sendErr error
 	var sendDur time.Duration
 	switch {
 	case st != nil && st.staged != nil:
 		// Staged: everything but the dot is already at the provider.
-		t0 := time.Now()
+		firedAt = time.Now()
 		sendErr = s.Courier.Commit(j.Config, st.staged)
-		sendDur = time.Since(t0)
+		sendDur = time.Since(firedAt)
 		if sendErr != nil && !errors.Is(sendErr, mailer.ErrDotOut) {
 			// The dot never left the wire. "Just go": one cold full send
 			// starting NOW — at the fire time, never later, never an
 			// abandoned job. (An ErrDotOut error takes the other branch of
 			// the contract below: terminal, because the dot may have
 			// gone out.)
-			log.Printf("WARNING job=%s msgid=%s held transaction lost before the dot (%v): cold send at fire time",
-				j.ID, j.MessageID, sendErr)
-			t0 = time.Now()
+			log.Printf("WARNING job=%s msgid=%s held transaction lost before the dot after %s (%v): cold send at fire time",
+				j.ID, j.MessageID, sendDur.Round(time.Millisecond), sendErr)
+			firedAt = time.Now()
 			sendErr = s.Courier.Send(j.Config, nil, msg, j.Content.To)
-			sendDur = time.Since(t0)
+			sendDur = time.Since(firedAt)
 		}
 	default:
 		// Cold path (no staged transaction): build and persist inflight
@@ -980,12 +999,17 @@ func (s *Scheduler) fire(j Job, st *warmState) error {
 				return fmt.Errorf("jobber: persisting inflight state for job %s: %w", j.ID, err)
 			}
 		}
-		t0 := time.Now()
+		firedAt = started
+		sendStart := time.Now()
 		sendErr = s.Courier.Send(j.Config, sess, msg, j.Content.To)
-		sendDur = time.Since(t0)
+		sendDur = time.Since(sendStart)
 	}
 
-	j.Result = &JobResult{FiredAt: now, Lateness: lateness, SendDuration: sendDur}
+	lateness := firedAt.Sub(j.FireAt)
+	if lateness < 0 {
+		lateness = 0
+	}
+	j.Result = &JobResult{FiredAt: firedAt, Lateness: lateness, SendDuration: sendDur}
 	if sendErr != nil {
 		j.State = StateFailed
 		j.Result.Err = sendErr.Error()

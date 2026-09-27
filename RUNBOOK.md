@@ -336,7 +336,11 @@ warmup it cannot finish before the deadline would only make it later.
 Human-side verification: compare the `FIRE` instant with the message
 `Date:` header and the inbox/ricevuta arrival time. Keep the machine
 NTP-synced (`timedatectl`) — sub-millisecond numbers are meaningless
-against a drifting clock. Lateness ≥2s is flagged explicitly as catch-up.
+against a drifting clock. A wake ≥2s past the fire time is flagged
+explicitly as catch-up (`WARNING … FIRED <delay> LATE`); a fallback
+send's recorded `LATE` additionally carries the time its dead held
+transaction consumed, so a large `LATE` alone does not mean the process
+was down.
 
 ## 10. Security checklist
 
@@ -369,7 +373,7 @@ against a drifting clock. Lateness ≥2s is flagged explicitly as catch-up.
 | `STAGED … upload=…` | envelope and full message at the provider, held one dot short of delivery |
 | `WARM … failed …: cold fallback` | warmup or staging failed before the dot; job still meets its deadline cold |
 | `FIRE … lateness=…` | the delivery act, µs-stamped — the dot write for a staged job; `(cold)` = no staged transaction, no warm session |
-| `WARNING … held transaction lost …: cold send at fire time` | the dot never left the wire; exactly one cold full send started at the fire time |
+| `WARNING … held transaction lost …: cold send at fire time` | the dot never left the wire; exactly one cold full send started at the fire time. The `after …` figure is what the dead held transaction consumed — it lands in the job's recorded `LATE` too, and the following `send=` measures the cold send |
 | `WARNING … FIRED <delay> LATE` | catch-up: no firing process existed at the deadline |
 | `SENT … send=…` | provider accepted the message |
 | `FAILED …` | terminal failure, never auto-retried — read `err=`; an error carrying `delivery dot was written, outcome uncertain` means the send MIGHT have gone out: verify the recipient inbox for the Message-ID (the §7 crash procedure) |

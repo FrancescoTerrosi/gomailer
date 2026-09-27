@@ -59,18 +59,19 @@ type sendCall struct {
 // and, by returning the body as the prepared message, lets tests identify
 // which job each send belongs to.
 type fakeCourier struct {
-	mu         sync.Mutex
-	prepareErr error
-	warmErr    error
-	stageErr   error
-	sendErr    error
-	commitErr  error
-	staged     any // nil = opt out of staging (pre-staging behavior)
-	prepares   []time.Time
-	warms      []time.Time
-	stages     []time.Time
-	commits    []time.Time
-	sends      []sendCall
+	mu          sync.Mutex
+	prepareErr  error
+	warmErr     error
+	stageErr    error
+	sendErr     error
+	commitErr   error
+	commitDelay time.Duration // how long Commit takes before its verdict
+	staged      any           // nil = opt out of staging (pre-staging behavior)
+	prepares    []time.Time
+	warms       []time.Time
+	stages      []time.Time
+	commits     []time.Time
+	sends       []sendCall
 }
 
 func (f *fakeCourier) Prepare(cfg mailer.MailConfig, c *mailer.MailContent) ([]byte, error) {
@@ -104,6 +105,9 @@ func (f *fakeCourier) Commit(cfg mailer.MailConfig, staged any) error {
 	f.mu.Lock()
 	f.commits = append(f.commits, time.Now())
 	f.mu.Unlock()
+	if f.commitDelay > 0 {
+		time.Sleep(f.commitDelay)
+	}
 	return f.commitErr
 }
 
@@ -1059,6 +1063,54 @@ func TestCommitDotWriteFailureFallsBackCold(t *testing.T) {
 	jobs, _ := store.Load()
 	if jobs[0].State != StateSent {
 		t.Fatalf("state = %q, want sent", jobs[0].State)
+	}
+}
+
+// TestFallbackStampCarriesTheLostHold: when the held commit fails before
+// the dot, the delivery that actually runs is the cold fallback — and the
+// record must stamp THAT attempt (JobResult.FiredAt: "the instant the
+// delivery attempt that produced the outcome began"). A commit that burns
+// its dot budget before failing pushes the fallback late by exactly that
+// much, and the recorded lateness must show the cost, not the entry
+// instant (regression: the stamp used to be taken at fire entry, silently
+// dropping the dead held transaction's time).
+func TestFallbackStampCarriesTheLostHold(t *testing.T) {
+	store := testStore(t)
+	s := NewScheduler(store)
+	c := &fakeCourier{
+		staged:      &stagedToken{},
+		commitErr:   errors.New("connection reset by peer"),
+		commitDelay: 300 * time.Millisecond,
+	}
+	s.Courier = c
+	fireAt := time.Now().Add(2 * time.Second)
+
+	content := testContent("lost hold")
+	if _, err := s.Schedule(testConfig(), &content, fireAt); err != nil {
+		t.Fatalf("Schedule: %v", err)
+	}
+	if err := s.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.commits) != 1 || len(c.sends) != 1 {
+		t.Fatalf("commits=%d sends=%d, want 1/1 (lost hold, then one cold send)", len(c.commits), len(c.sends))
+	}
+	jobs, _ := store.Load()
+	res := jobs[0].Result
+	if res == nil || jobs[0].State != StateSent {
+		t.Fatalf("state=%q result=%v, want a clean sent", jobs[0].State, res)
+	}
+	// The fallback began ~300ms after the fire time (the lost hold's
+	// cost): the recorded lateness must show it, not the entry instant.
+	if res.Lateness < 250*time.Millisecond {
+		t.Fatalf("recorded lateness = %v, want >= 250ms (the failed commit's cost must be visible)", res.Lateness)
+	}
+	// FiredAt is the fallback send's start, not the fire-phase entry.
+	if d := c.sends[0].at.Sub(res.FiredAt); d < -50*time.Millisecond || d > 50*time.Millisecond {
+		t.Fatalf("FiredAt is %v off the fallback send's start; it must stamp the attempt that actually ran", d)
 	}
 }
 
