@@ -41,12 +41,8 @@ instead of conventional:
     ./gomailer -daemon                          # foreground; systemd in production
     ./gomailer -daemon -store /var/lib/gomailer/jobs.json
 
-In production, `sudo ./install.sh` performs the full unit install in one
-command (idempotent — rerunning it is the upgrade path: a running daemon
-is restarted, draining in-flight sends gracefully); `sudo ./uninstall.sh`
-reverses it, **keeping the evidence store by default** unless
-`--purge-state`. It installs [gomailer.service](gomailer.service) and
-[gomailer.sysusers.conf](gomailer.sysusers.conf):
+Install [gomailer.service](gomailer.service) and
+[gomailer.sysusers.conf](gomailer.sysusers.conf) (systemd):
 `systemd-sysusers` creates the dedicated `gomailer` account the daemon runs
 as, the unit restarts it after crashes and starts it at boot. The daemon
 itself carries no credentials — jobs do — so the unit needs no
