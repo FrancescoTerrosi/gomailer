@@ -68,6 +68,9 @@ Receipt kinds emitted downstream (for reference, via `X-Ricevuta`):
 - With attachments: `multipart/mixed` — text part first, each attachment after.
 - Each attachment carries `Content-Type`, `Content-Disposition: attachment`,
   and `Content-Transfer-Encoding: base64`.
+- Base64 content is line-wrapped at 76 characters (RFC 2045), and any text
+  body whose lines would exceed SMTP's 998-octet limit switches to base64
+  — no line in a built message can break delivery on a strict MTA.
 - Mandatory headers present on every message: `From`, `To`, `Subject`, `Date`,
   `Message-ID`, `MIME-Version: 1.0`.
 
@@ -95,4 +98,4 @@ Receipt kinds emitted downstream (for reference, via `X-Ricevuta`):
 | 4. Receipts | `pec.go` → `TipoRicevuta` (`completa`/`breve`/`sintetica`); provider-generated receipts are out of scope |
 | 5. MIME structure | `message.go` → `build` (single-part vs `multipart/mixed`) |
 | 6. Message-ID & Date | `message.go` → `GenerateMessageID`, `Date` header |
-| 7. Header encoding | `message.go` → `encodeHeaderWord`, `encodeFilename`, `encodeText` |
+| 7. Header encoding | `message.go` → `encodeHeaderWord`, `encodeFilename`, `encodeText` (76-char-wrapped base64, over-long lines fall back to base64) + `renderSubject`/`foldAddressList` (RFC 5322 folding, no line can overflow the SMTP limit) |

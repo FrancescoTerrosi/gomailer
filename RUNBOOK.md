@@ -1,0 +1,498 @@
+# RUNBOOK.md — gomailer operations
+
+The operator's manual: what to type, what the output means, and what to
+do when things go wrong. Design and rationale live in
+[README.md](README.md); PEC compliance in [PEC.md](PEC.md).
+
+All transcripts below were captured on a test machine (UTC clock, a local
+SMTPS provider, scratch store paths) — your timestamps, paths, job IDs and
+Message-IDs will differ; the shapes are exactly what you will see.
+
+## 1. Cheat sheet
+
+| Task | Command |
+|---|---|
+| Install / upgrade | `sudo ./install.sh` (idempotent; restarts a running daemon) |
+| Uninstall | `sudo ./uninstall.sh` (keeps the evidence store; `--purge-state` to also delete it) |
+| Build | `go build -o gomailer .` |
+| Run the daemon | `gomailer -daemon` (systemd in production) |
+| Health check | `gomailer -ping` |
+| Schedule a mail | `gomailer -at "15:00:00" -to dest@pec.it -subject S -body B` |
+| Inspect the store | `gomailer -list` |
+| Fire everything pending, no daemon | `gomailer` (bare) |
+| Daemon logs | `journalctl -u gomailer -f` (or the foreground console) |
+| Stop the daemon | `systemctl stop gomailer` (graceful) |
+
+## 2. Install & first start
+
+    go build -o gomailer .
+    sudo ./install.sh
+
+Build once on any machine with the Go toolchain (`go build -o gomailer .`),
+then install from the repository root. `install.sh` installs the
+pre-built binary, the unit and the sysusers conf, creates the service
+user, enables and starts the daemon — no Go toolchain on the target
+box, no network, nothing downloaded. It is idempotent, so re-running it
+is safe — and the re-run IS the upgrade path (build the new binary,
+re-run): a running daemon is restarted, which drains in-flight sends
+gracefully (§8's stop discipline) instead of leaving a half-installed
+binary. For the record, what it does:
+
+    sudo install -m755 gomailer /usr/local/bin/gomailer
+    sudo install -m644 gomailer.service /etc/systemd/system/gomailer.service
+    sudo install -D -m644 gomailer.sysusers.conf /etc/sysusers.d/gomailer.conf
+    sudo systemd-sysusers                # creates the gomailer user/group
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now gomailer
+
+`systemd-sysusers` reads [gomailer.sysusers.conf](gomailer.sysusers.conf) and
+creates the dedicated `gomailer` system account; it is idempotent, so
+re-running the install is safe. (`/etc/sysusers.d` is the admin override
+tier — nothing in the Ubuntu/Debian archive writes there, so a stock
+system doesn't ship the directory; `install -D` creates it together with
+the file. `/usr/lib/sysusers.d/gomailer.conf` works equally, both are in
+systemd-sysusers' search path, and `/etc` takes precedence.) The service
+runs as that user, and systemd's
+`StateDirectory=` creates `/var/lib/gomailer` (0700) owned by it — no manual
+`mkdir`/`chown`, and the store never runs as root. The unit also sandboxes
+the daemon: read-only filesystem except the state dir, a `@system-service`
+syscall filter, an empty capability set, `UMask=0077` (see the unit's
+comments). It needs systemd ≥ 247 (Debian 11+, Ubuntu 22.04+).
+
+Credentials are captured **per job, at scheduling time**, from the client's
+environment (`-pass` or `$PEC_PASSWORD`); the daemon itself carries no
+credentials — it only replays job configs, and the unit's `EnvironmentFile`
+is optional. Because the store and the control socket are 0600 and
+owner-only, **scheduling clients must run as the same `gomailer` user**:
+
+    sudo -u gomailer env PEC_PASSWORD=... gomailer -in 2m -to dest@pec.it \
+          -subject S -body B -store /var/lib/gomailer/jobs.json
+
+Typing `sudo -u gomailer` and `-store` for every client is friction, not
+security — sudo IS the privilege boundary (the `gomailer` account is
+locked, so `su` cannot reach it), so the fix is to hide it, not remove it.
+Two tiers:
+
+**Tier 1 — a shell function** (per operator, no admin rights) — which also
+pins the store (killing the stray-store footgun) and prompts for the
+password off-tty so it never lands in shell history or argv:
+
+    gm() {
+      [ -n "$PEC_PASSWORD" ] || { printf 'PEC password: ' >&2; stty -echo; read PEC_PASSWORD; stty echo; printf '\n' >&2; export PEC_PASSWORD; }
+      sudo -u gomailer env PEC_PASSWORD="$PEC_PASSWORD" \
+           gomailer -store /var/lib/gomailer/jobs.json "$@"
+    }
+    gm -in 2m -to dest@pec.it -subject S -body B -attach contratto.pdf
+
+**Tier 2 — a contained sudoers grant** (once per machine) drops even the
+password prompt — exactly one binary, one target user:
+
+    # /etc/sudoers.d/gomailer     (validate: sudo visudo -cf /etc/sudoers.d/gomailer)
+    Defaults!/usr/local/bin/gomailer env_keep += "PEC_PASSWORD"
+    %gomailer-ops ALL=(gomailer) NOPASSWD: /usr/local/bin/gomailer
+
+plus a thin wrapper `/usr/local/bin/gm` pinning `-store`:
+
+    #!/bin/sh
+    [ -n "$PEC_PASSWORD" ] || { printf 'PEC password: ' >&2; stty -echo; read PEC_PASSWORD; stty echo; printf '\n' >&2; export PEC_PASSWORD; }
+    exec sudo -u gomailer /usr/local/bin/gomailer -store /var/lib/gomailer/jobs.json "$@"
+
+Operators in `gomailer-ops` (create it with `groupadd`) then schedule with
+plain `gm -in 2m ...`. NEVER grant `NOPASSWD: /usr/bin/env` instead — `env`
+execs anything, which is arbitrary code as gomailer; Tier 2 allows the
+binary directly and carries the password via the per-command `env_keep`.
+For a burst of interactive scheduling, `sudo -u gomailer -s` also works
+(the nologin shell blocks `sudo -i`, not `sudo -s`).
+
+### Uninstall
+
+    sudo ./uninstall.sh
+
+Reverses the install: stops the daemon (gracefully — a send in flight
+finishes its commit, never a mid-send kill), disables the unit, removes
+the binary, unit and sysusers conf, and reloads systemd. **The state
+dir is KEPT**: `/var/lib/gomailer` is the evidence store (§6) and carries
+the credentials of jobs still pending. `--purge-state` deletes it too —
+it asks for a typed confirmation; `--purge-state --yes` confirms
+non-interactively. The `gomailer` user/group and `/etc/gomailer.env`
+are left in place (an unused system account is harmless; deleting
+accounts is riskier than leaving them).
+
+## 3. The daemon: run, check, stop
+
+Manual run (foreground, e.g. a one-off box without systemd):
+
+    $ ./gomailer -daemon -store /var/lib/gomailer/jobs.json
+    ... daemon mode: collecting schedules for the store; submissions on /var/lib/gomailer/gomailer.sock (stop with SIGTERM)
+    ... queue: 0 pending, 0 sent, 0 failed (history kept in the store)
+    ... daemon: accepting submissions on /var/lib/gomailer/gomailer.sock
+
+Health check from anywhere — exit 0 means "accepting submissions":
+
+    $ ./gomailer -ping -store /var/lib/gomailer/jobs.json
+    ... daemon on /var/lib/gomailer/gomailer.sock: protocol 2, 3 job(s) pending
+
+    $ ./gomailer -ping -store /var/lib/gomailer/jobs.json
+    ... ping: daemon: reaching /var/lib/gomailer/gomailer.sock: dial unix ...: connect: no such file or directory
+    $ echo $?
+    1
+
+Stop is graceful (SIGTERM, or `systemctl stop`): jobs already inside their
+warmup window or mid-send run to completion; everything still waiting stays
+**pending in the store** and re-arms at the next start:
+
+    ... run stopped (context canceled): 3 job(s) left pending in the store; they re-arm at the next start
+    ... daemon: stopped
+
+Restart re-arms everything with no loss:
+
+    ... queue: 3 pending, 0 sent, 0 failed (history kept in the store)
+    ... daemon: accepting submissions on /var/lib/gomailer/gomailer.sock
+
+Under systemd: `systemctl status gomailer`, `journalctl -u gomailer -f`.
+Crashes are restarted automatically (`Restart=on-failure`); a clean stop
+is not.
+
+**A second daemon on the same store is refused by design** — it would
+re-send every pending job (duplicate certified messages). Same for a
+manual resume while the daemon owns the store:
+
+    $ ./gomailer -daemon -store /var/lib/gomailer/jobs.json
+    ... daemon: jobber: another scheduler is already firing jobs from store /var/lib/gomailer/jobs.json — refusing to start a second one (it would duplicate certified sends); stop it first or inspect with -list
+
+When you see this, a firing process already owns the store: find it
+(`systemctl status gomailer`, `pgrep -a gomailer`) and use it; `-list` and
+`-ping` are always safe. The lock dies with its holder — a crashed daemon
+never leaves a stale refusal behind.
+
+## 4. Scheduling certified emails
+
+With the daemon running, every scheduling client only *submits* — it never
+sends. The job is persisted **before** the acknowledgment, with a
+pre-generated Message-ID for correlating the recipient inbox and the
+ricevuta:
+
+    $ export PEC_PASSWORD=...                        # keep it out of shell history
+    $ ./gomailer -in 45m -to studio.rossi@pec.it -subject "Contratto v2" \
+          -body "In allegato il contratto firmato." -store /var/lib/gomailer/jobs.json
+    ... fire time resolved: 2026-09-26 17:06:23.903222 +0000 UTC
+    ... SCHEDULED job=c583704f3eeab5ba msgid=<d846c111-797c-4cf4-91b5-37a630169f80@legalmail.it> to=studio.rossi@pec.it fire=2026-09-26 17:06:23.903222 +0000 (in 44m59.994s) state=pending — collected by the daemon on /var/lib/gomailer/gomailer.sock
+
+The `fire time resolved` line always shows the zone — a silent UTC parse on
+a local-clock mind is the classic scheduling bug; read it before trusting
+it.
+
+Fire-time forms (`-at` wins over `-in`):
+
+| Form | Meaning |
+|---|---|
+| `-in 90s` / `-in 5m` / `-in 1h30m` | relative to now |
+| `-at "15:04:05"` | today at that local clock time; **rolls to tomorrow if already past** |
+| `-at "2026-12-24 09:00:00"` | local date and time |
+| `-at "2026-12-24T09:00:00+02:00"` | RFC3339 with explicit offset |
+
+    $ ./gomailer -at "09:15:00" ...    # 16:21 on the test box → tomorrow
+    ... SCHEDULED job=8d06a1e8f7f436ce ... fire=2026-09-27 09:15:00.000000 +0000 (in 16h53m36.081s) state=pending — collected by the daemon ...
+
+Recipients: comma-separated on `-to`. Attachments ride the repeatable
+`-attach <file>` flag — one flag occurrence per file
+(`-attach contratto.pdf -attach appendice.txt`), read once at
+scheduling time; the recipient sees the file's base name.
+`X-Riferimento-Message-ID` and receipt-type selection are mailer
+features reachable through the socket protocol / library, not the CLI.
+
+**Validation happens at scheduling time** (in the daemon), so a typo never
+surfaces at fire time; errors travel back to the client and it exits 1:
+
+    $ ./gomailer -in 10m -to dest@pec.it -subject x -body "" ...
+    ... daemon rejected the job: jobber: empty body
+
+    $ ./gomailer -in -5m -to dest@pec.it -subject x -body "troppo tardi" ...
+    ... daemon rejected the job: jobber: fire time 2026-09-26 16:16:27 +0000 is already in the past
+
+No password set is only a warning at scheduling — the failure surfaces at
+fire time, so take it seriously:
+
+    ... WARNING: no password given (set -pass or $PEC_PASSWORD): the send will fail at auth
+
+Policy flags `-min-lead`, `-lead`, `-max-payload` and `-keep-payloads`
+are **daemon-side**: when
+submitting to a running daemon, the daemon's values apply. The future 24/7
+service sets `-min-lead 24h` so a job with a deadline in the past cannot
+exist by construction. `-max-payload` (default **70 MB**, body +
+attachments, `0` disables) mirrors the default provider's published
+guarantee — Legalmail certifies delivery only up to 70 MB of attachments
+per message (Manuale Operativo §5.1) — so an oversized submission is
+rejected at scheduling time instead of failing at fire time. Recipients
+are likewise capped at 1000 per send, matching the provider's limit.
+`-keep-payloads` opts out of the retention policy: payload bytes are
+then kept after the job settles too (the pre-policy behavior) — by
+default they are released once the send's outcome is recorded, because
+conserving the originals for legal purposes is the sender's
+responsibility, not gomailer's.
+
+## 5. Manual operation (no daemon)
+
+For a one-off box (no systemd, no resident process) the same binary does
+everything, in two steps. **Step 1** — schedule; with no daemon reachable
+the client persists anyway and warns:
+
+    $ ./gomailer -in 3s -to studio.bianchi@pec.it -subject "Sollecito" \
+          -body "Promemoria: scadenza domani." -store /var/lib/gomailer/jobs.json
+    ... fire time resolved: 2026-09-26 16:21:36.887276 +0000 UTC
+    ... daemon not reachable on /var/lib/gomailer/gomailer.sock: daemon: reaching ...: connect: no such file or directory
+    ... SCHEDULED job=29a729c4633041d2 msgid=<0989bc37-d245-41dc-93a7-374831ea5a45@legalmail.it> to=studio.bianchi@pec.it fire=2026-09-26 16:21:36.887276 +0000 (in 3s)
+    ... WARNING: job 29a729c4633041d2 is persisted but NOT armed (no daemon running): it will fire only when the daemon next starts (gomailer -daemon) or resume mode runs — check with -list before re-running this command (a re-run schedules a second job)
+
+The submission is **idempotent within one invocation**: the client
+pre-generates the job ID and reuses it for the persist fallback and one
+short retry, so a daemon dying between persisting and acknowledging cannot
+duplicate the job. A *re-run of the command* is a new invocation with a new
+ID — after an ambiguous failure, check `-list` first.
+
+**Step 2** — fire with the bare invocation (resume mode: fires everything
+pending and exits when the queue is empty):
+
+    $ ./gomailer -store /var/lib/gomailer/jobs.json
+    ... no -at/-in given: resume mode
+    ... queue: 1 pending, 0 sent, 0 failed (history kept in the store)
+    ... WARNING job=29a729c4633041d2 msgid=<0989bc37-...@legalmail.it> FIRED 2.017s LATE (process/machine was not running at the fire time) fired=2026-09-26 16:21:38.904356 +0000
+    ... SENT     job=29a729c4633041d2 msgid=<0989bc37-...@legalmail.it> send=50ms
+    ... queue empty; done
+
+The `FIRED … LATE` line is the catch-up path: the deadline passed while no
+firing process existed, so the send started as soon as one did. If the
+deadline is legally binding, that line is your audit trail.
+
+Two manual-mode facts to plan around:
+
+- Resume mode **holds the firing right** for as long as it runs; while it
+  waits for future jobs it blocks the daemon (and vice versa). Choose one.
+- It waits for *all* pending jobs: with a job due tomorrow in the store it
+  stays up until tomorrow. That is a feature (one-shot "fire everything"
+  mode), not a hang.
+
+## 6. Inspecting the store
+
+    $ ./gomailer -list -store /var/lib/gomailer/jobs.json
+    ID                 STATE    FIRE AT                    LATE      SEND    MESSAGE-ID
+    c583704f3eeab5ba   pending  2026-09-26 17:06:23 +0000  -         -       <d846c111-...@legalmail.it>
+    8d06a1e8f7f436ce   pending  2026-09-27 09:15:00 +0000  -         -       <29f6103a-...@legalmail.it>
+    a7e5160fb1faf640   pending  2026-12-24 09:00:00 +0000  -         -       <3222e1eb-...@legalmail.it>
+
+After firing, the same table carries the timing paper trail (`LATE` is the
+recorded lateness, `SEND` the SMTP session length):
+
+    29a729c4633041d2   sent     2026-09-26 16:21:36 +0000  2.01708s  50ms    <0989bc37-...@legalmail.it>
+
+`-list` is read-only and safe at any time, daemon running or not. The store
+is a **slim human-readable JSON index** (mode 0600 — it contains the
+mailbox credentials of the jobs still waiting to fire; terminal rows are
+stripped of theirs) plus one **blob file per job** under `jobs.json.blobs/`
+next to it (the blob directory is named after the store file, so two
+stores in one directory can never destroy each other's payloads),
+holding that job's body and attachments — **while the job can still
+fire**: the persist that records sent/failed also releases the blob,
+keeping the row's sha256 as the permanent fingerprint. The split is the
+fix for the fat-workload trap where every mutation rewrote every byte
+ever stored (a 70MB index cost seconds per write, on the warm window's
+critical path); now an index rewrite is O(rows) whatever the payloads,
+and the blob directory is bounded by the live queue, not by history.
+Each pending row references its blob by name and anchors it with a
+sha256 (`ContentSHA256`) — reassembled and **verified** before any byte
+can reach the wire. Copy the index with `cp` whenever you like; the
+atomic rename means a reader always sees the old or the new file, never
+a torn one. Rows are kept forever — the index is the audit log;
+**conserving the payload originals for legal purposes is the sender's
+responsibility, not gomailer's** (see Housekeeping below).
+
+Sidecar files beside it implement the process discipline: `jobs.json.lock`
+(cross-process write serialization) and `jobs.json.runlock` (the firing
+right); the blobs live in their own store-named sidecar directory,
+`jobs.json.blobs/`. Back them up along with the store or accept that a
+restore needs a daemon restart, which recreates them.
+
+### Housekeeping (optional — the payloads now clean up after themselves)
+
+**Retention policy**: a payload blob lives only while its job can still
+fire. The persist that records `sent`/`failed` also releases the blob
+(see the `RELEASED` log line): the row keeps its sha256 as the permanent
+fingerprint, the bytes are deleted. The `jobs.json.blobs/` directory is
+therefore bounded by the live queue, not by history — no trimming, no
+unbounded growth. Rows are kept forever (the index is the audit log);
+if you want to shrink THAT, the trim recipe below archives terminal
+rows out of the index. Two notes:
+
+- **Conserving the payload originals for legal purposes is the sender's
+  responsibility, not gomailer's.** A ricevuta `breve` binds its hashes
+  to the attachment originals the SENDER must keep (DM 2/11/2005 —
+  "il mittente conservi gli originali immodificati degli allegati");
+  keep your own copy of what you send. `-keep-payloads` restores the
+  keep-forever behavior for the conservative operator.
+- On the first boot after upgrading, gomailer brings pre-existing
+  terminal rows under the policy (`STORE: released N terminal
+  payload(s)` — a one-time eviction, loudly logged). Re-run with
+  `-keep-payloads` first if you would rather archive those old blobs
+  yourself.
+
+    sudo systemctl stop gomailer
+    cd /var/lib/gomailer
+    A=$(date +%F)
+    sudo cp jobs.json "archive-$A.json"
+    sudo mkdir -p "archive-$A.blobs"
+    for f in $(sudo jq -r '.Jobs[] | select(.State=="sent" or .State=="failed") | .ContentFile // empty' "archive-$A.json"); do
+        sudo mv "jobs.json.blobs/$f" "archive-$A.blobs/"
+    done
+    sudo jq '{version: 2, jobs: [.Jobs[] | select(.State=="pending" or .State=="inflight")]}' \
+        "archive-$A.json" | sudo tee /tmp/trim.json >/dev/null
+    sudo install -o gomailer -g gomailer -m 600 /tmp/trim.json jobs.json && rm /tmp/trim.json
+    sudo systemctl start gomailer
+
+(The blob-move loop only moves blobs for rows that still have one —
+settled rows written by release-aware gomailers carry `ContentFile:
+""` and keep only their fingerprint; legacy rows from before the policy
+may still carry files.) Pending and inflight rows (and their blobs) must
+survive any trim — they are the live queue. A pending job whose blob is
+missing fails terminally at its window with `payload source failed …`
+(never auto-resent).window with `payload source failed …` (never auto-resent).
+
+## 7. Reboots, crashes, and recovery
+
+| Situation | What happens | What you do |
+|---|---|---|
+| Reboot **before** a fire time | systemd starts the daemon; jobs re-arm and still fire **on time** | nothing |
+| Machine down **at** the fire time | job fires at daemon start, logged `FIRED <delay> LATE` | check the delay against your deadline |
+| Daemon stopped, restarted later | pending jobs re-arm; if the deadline passed meanwhile → catch-up | prefer `systemctl stop` only when no imminent deadlines |
+| Daemon **crashes during the send** | job stays `inflight` on disk; next boot marks it `failed` with a manual-verification note, **never auto-resent** | follow the procedure below |
+| Daemon down when a client schedules | job persisted, **not armed**; fires when a daemon next starts (catch-up if late) | start the daemon |
+
+**Crash-during-send procedure** (a duplicate certified message is worse
+than a late one, so the tool never guesses):
+
+    $ systemctl start gomailer
+    journalctl -u gomailer | grep RECOVER
+    ... RECOVER job=b971d39c63f404b1 msgid=<b83dc0dd-...@legalmail.it> was inflight at boot: interrupted during send, NOT auto-resent — verify the recipient inbox for <b83dc0dd-...@legalmail.it>
+
+    $ gomailer -list -store /var/lib/gomailer/jobs.json
+    b971d39c63f404b1   failed   2026-09-26 16:00:23 +0000  0s   0s   <b83dc0dd-...@legalmail.it>
+      error: interrupted during send (previous process died mid-send): NOT auto-resent; verify the recipient inbox for the Message-ID
+
+1. Search the recipient inbox (and the sender's ricevute) for the logged
+   Message-ID.
+2. Delivered? Nothing to do — the failure row is just history.
+3. Not delivered? A human decides to re-send by scheduling a **new** job
+   (fresh Message-ID). Do not edit the store by hand to flip states.
+
+A fire-time send failure (bad credentials, provider outage) follows the
+same rule — recorded `failed` with the error, never auto-retried:
+
+    ... FAILED job=... msgid=<...> send=1.767s err=mailer: auth: 535 "invalid user ID or password"
+
+Fix the cause, schedule again.
+
+## 8. Troubleshooting
+
+| Symptom | Cause | Action |
+|---|---|---|
+| `another scheduler is already firing jobs from store …` | a firing process already owns the store (run lock) | find it: `systemctl status gomailer` / `pgrep -a gomailer`; `-list`/`-ping` are always safe |
+| `daemon not reachable …` + `WARNING: … persisted but NOT armed` | daemon down at scheduling time | start it (`systemctl start gomailer`); the job fires at startup, catch-up if late |
+| schedule command died ambiguously (daemon crash mid-ack) | the submission is idempotent within one invocation: at most one job exists | `gomailer -list` — one pending row for your message ⇒ nothing to redo; **do not blindly re-run the command** (a new invocation = new job) |
+| `daemon rejected the job: jobber: …` (empty body, no recipients, bare-address forms, `already in the past`, payload above the `-max-payload` limit, more than 1000 recipients) | validation, by design at scheduling time | fix the command; nothing was persisted |
+| `WARNING: no password given` | empty `-pass`/`$PEC_PASSWORD` at scheduling | the send WILL fail at auth — re-schedule with credentials |
+| `FAILED … err=mailer: auth: …` / `tls dial` / `starttls` | provider rejected at fire time | fix credentials/network; schedule a new job; the failed one stays as history |
+| Clients keep falling back although a daemon runs | socket file deleted or `-sock` mismatch | restart the daemon (it recreates the socket); check clients and daemon use the same `-store` (the default socket is `<store dir>/gomailer.sock`) |
+| `systemctl stop` is slow to return | a runner holding a staged dot is committed: it finishes its commit at the fire time, bounded by the warm window plus the per-command read/write deadlines — all sized inside `TimeoutStopSec=90s` | nothing: wait for the drain; a wedged provider now fails the job inside its deadline instead of hanging the stop |
+| Everything fires seconds late | machine clock not NTP-synced | `timedatectl`; lateness is measured against the local clock |
+| `-ping` fine but you expected more pending jobs | wrong store path | `-ping`/`-list`/daemon must share one `-store` |
+| `FAILED … payload source failed … (integrity check / reading content blob)` | the job's blob is missing or failed its sha256 — never sent, never auto-resent | do NOT restore-and-refire blindly: the row is history; verify the blobs dir (disk, backups, a bad trim), then schedule a NEW job |
+
+## 9. Timing verification
+
+The daemon's log is the evidence: `WARM` (session opened in the window),
+`STAGED` (envelope and full message at the provider, `upload=` measuring
+the streaming), `FIRE` (µs-stamped, with measured lateness — for a staged
+job it stamps **the dot**, the delivery act), `SENT` (whose `send=` is
+then just the commit round-trip). Two jobs scheduled for the same instant
+fire **in parallel**, each over its own held transaction (the tending
+loop hands every job off as its window opens, not just the first):
+
+    ... WARM  job=6fd59f3e757a25e3 msgid=<7d1af80b-...> session ready in 49ms (2.945s before fire)
+    ... WARM  job=63023c51573b764e msgid=<df4006e2-...> session ready in 51ms (2.955s before fire)
+    ... FIRE  job=6fd59f3e757a25e3 msgid=<7d1af80b-...> fired=2026-09-26 16:02:13.000720 +0000 lateness=720.153µs
+    ... FIRE  job=63023c51573b764e msgid=<df4006e2-...> fired=2026-09-26 16:02:13.000711 +0000 lateness=711.42µs
+    ... SENT  job=6fd59f3e757a25e3 msgid=<7d1af80b-...> send=3ms
+    ... SENT  job=63023c51573b764e msgid=<df4006e2-...> send=49ms
+
+A job scheduled *inside* its warm window with too little time left (or
+catching up) still fires cold — the `(cold)` marker — because starting a
+warmup it cannot finish before the deadline would only make it later.
+
+Human-side verification: compare the `FIRE` instant with the message
+`Date:` header and the inbox/ricevuta arrival time. Keep the machine
+NTP-synced (`timedatectl`) — sub-millisecond numbers are meaningless
+against a drifting clock. A wake ≥2s past the fire time is flagged
+explicitly as catch-up (`WARNING … FIRED <delay> LATE`); a fallback
+send's recorded `LATE` additionally carries the time its dead held
+transaction consumed, so a large `LATE` alone does not mean the process
+was down.
+
+## 10. Security checklist
+
+- Store file: mode 0600, contains the mailbox credentials of the jobs
+  still waiting to fire (terminal rows are stripped of theirs) —
+  restrict the directory, never commit it, back it up like a password
+  file. The `jobs.json.blobs/` payload files (present while a job can
+  still fire) are 0600 too (owner-only) —
+  they are
+  legally binding evidence, treat the whole state dir as one unit.
+- Control socket: 0600, owner-only, local machine only; requests carry
+  credentials. Do not loosen the permissions.
+- `/etc/gomailer.env`: mode 600.
+- `-insecure` (skip TLS verification) is for local testing only — PEC
+  mandates a verified TLS 1.2+ channel in production.
+- `gomailer.service` sandbox: `NoNewPrivileges`, `ProtectSystem=strict`
+  (only `/var/lib/gomailer` stays writable),
+  `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, a `@system-service`
+  syscall filter with an empty `CapabilityBoundingSet`, and `UMask=0077`
+  — which also closes the socket bind→chmod window. Keep these when
+  editing the unit, and keep `PrivateUsers`/`DynamicUser` OFF: clients
+  reach the 0600 socket only as the same persistent `gomailer` user, and
+  the store must keep one owner across reboots.
+
+## 11. Log line glossary
+
+| Line | Meaning |
+|---|---|
+| `SCHEDULED` | job persisted and armed (client ack mirrors it); `payload=` names the bytes that will cross the wire — the uplink baseline (TODO.md item 5) |
+| `STORE: split N legacy row(s) …` | one-time boot migration of a pre-split store: payload bytes moved to per-job blobs, the index rewritten slim |
+| `STORE: adopted N blob(s) …` | one-time boot step for stores written by the first split builds: referenced blobs moved from the shared `blobs/` directory into the store's own `jobs.json.blobs/` |
+| `STORE: swept N orphan blob(s) …` | boot removed blob files no row references (crash residue between blob write and row save, or between a release's row write and its file delete — pure disk) |
+| `STORE: released N terminal payload(s) …` | one-time boot step bringing pre-policy terminal rows under the retention policy: their blobs deleted, rows keep the sha256 fingerprint |
+| `STORE: dropped the inline payload of N settled row(s) …` | migration of a pre-split store slimmed settled rows (the inline bytes were the settled jobs' payloads — released by policy, not lost) |
+| `queue: N pending, …` | boot snapshot after recovery |
+| `daemon: accepting submissions on …` | socket is live — health checks turn green |
+| `WARM … session ready in …` | warmup done off the critical path |
+| `STAGED … upload=…` | envelope and full message at the provider, held one dot short of delivery |
+| `WARM … failed …: cold fallback` | warmup or staging failed before the dot; job still meets its deadline cold |
+| `FIRE … lateness=…` | the delivery act, µs-stamped — the dot write for a staged job; `(cold)` = no staged transaction, no warm session |
+| `WARNING … held transaction lost …: cold send at fire time` | the dot never left the wire; exactly one cold full send started at the fire time. The `after …` figure is what the dead held transaction consumed — it lands in the job's recorded `LATE` too, and the following `send=` measures the cold send |
+| `WARNING … FIRED <delay> LATE` | catch-up: no firing process existed at the deadline |
+| `SENT … send=…` | provider accepted the message |
+| `RELEASED …` | the job settled: its payload blob was deleted in the same atomic write that recorded the outcome; the row keeps the sha256 fingerprint. The bytes are now the sender's to conserve, not the store's |
+| `FAILED …` | terminal failure, never auto-retried — read `err=`; an error carrying `delivery dot was written, outcome uncertain` means the send MIGHT have gone out: verify the recipient inbox for the Message-ID (the §7 crash procedure); one carrying `payload source failed` means the blob was missing or corrupt and nothing was sent (§8) |
+| `RECOVER …` | boot found a job interrupted mid-send: manual verification |
+| `SECURITY swept …` | boot found terminal rows still carrying a credential (written by an older gomailer) and blanked it |
+| `CRITICAL … send result could not be persisted` | send happened but the store write failed; next boot flags it |
+| `run stopped (…): N job(s) left pending` | graceful stop; pending jobs re-arm at next start |
+
+## 12. Multiple mailboxes / stores
+
+The run lock, socket default and store are per **store file**. To serve two
+mailboxes on one machine, give each its own store *directory* (the default
+socket is `<store dir>/gomailer.sock`) or pin `-sock` explicitly:
+
+    gomailer -daemon -store /var/lib/gomailer-a/jobs.json
+    gomailer -daemon -store /var/lib/gomailer-b/jobs.json
+
+Two daemons on the *same* store are always refused — that refusal is the
+guarantee that no certified mail is ever sent twice.

@@ -2,78 +2,219 @@
 
 Go sender and scheduler for **PEC** (Posta Elettronica Certificata). The
 mailer package and its compliance requirements are documented in
-[PEC.md](PEC.md); this file covers the scheduler and its CLI.
+[PEC.md](PEC.md); this file covers the daemon, the CLI and the timing.
+Hands-on operations — commands, expected output, failure scenarios and
+recovery procedures — live in [RUNBOOK.md](RUNBOOK.md).
+
+## Architecture — one daemon fires, clients only schedule
+
+Scheduling a mail must never spawn a *second sending process*: when every
+`-at` invocation also ran its own firing loop, each one loaded the whole
+store and re-sent **every pending job** — duplicate certified messages,
+each legally binding. The process boundary now matches the responsibility:
+
+| Role | Invocation | What it does |
+|---|---|---|
+| **Daemon** | `gomailer -daemon` | THE one firing process: loads the store, re-arms every pending job, collects submissions over a Unix socket, fires jobs **concurrently**, idles forever |
+| **Client** | `gomailer -at/-in ...` | submits the job to the daemon and exits; **never sends anything**. Daemon unreachable ⇒ the job is still persisted and fires when the daemon next starts |
+| **Resume** | `gomailer` (bare) | fire everything pending and exit (after a reboot); refused while the daemon owns the store |
+
+Two locks make the "exactly one firing process" property mechanical
+instead of conventional:
+
+- **Run lock** (`<store>.runlock`, exclusive flock): a second firing
+  process — second daemon, or a resume racing the daemon — fails fast
+  with `another scheduler is already firing jobs from this store`. The
+  kernel releases the flock when the holder dies, so a crashed daemon
+  leaves no stale lock.
+- **Mutation lock** (`<store>.lock`, short-lived flock around each
+  read-modify-write): the daemon and a persist-only client can never lose
+  each other's writes.
 
 ## Build
 
     go build -o gomailer .
 
-## Schedule one email and check the timing
+## Run the daemon
 
-    export PEC_PASSWORD=...                     # mailbox password (keep it out of shell history)
-    ./gomailer -at "15:00:00" -to dest@pec.it -subject test -body "timing check"
-    ./gomailer -in 2m    -to dest@pec.it -subject test -body "timing check"
+    export PEC_PASSWORD=...
+    ./gomailer -daemon                          # foreground; systemd in production
+    ./gomailer -daemon -store /var/lib/gomailer/jobs.json
 
-The job is **persisted before it is acknowledged**, with a pre-generated
-`Message-ID`, so you can correlate it with the recipient inbox and the
-ricevuta. The process fires it at the exact fire time and exits when the
-queue is empty. Logs carry µs timestamps and report the measured drift:
+In production, after `go build -o gomailer .`, `sudo ./install.sh`
+performs the full unit install in one command — it installs the
+pre-built binary plus the unit files (no Go toolchain on the target
+box, nothing downloaded) and is idempotent: rerunning it is the upgrade
+path (a running daemon is restarted, draining in-flight sends
+gracefully). `sudo ./uninstall.sh` reverses it, **keeping the evidence
+store by default** unless `--purge-state`. It installs
+[gomailer.service](gomailer.service) and
+[gomailer.sysusers.conf](gomailer.sysusers.conf):
+`systemd-sysusers` creates the dedicated `gomailer` account the daemon runs
+as, the unit restarts it after crashes and starts it at boot. The daemon
+itself carries no credentials — jobs do — so the unit needs no
+`PEC_PASSWORD`; scheduling clients run as the same `gomailer` user because
+the store and socket are owner-only (see [RUNBOOK.md](RUNBOOK.md) §2).
+Stopping is graceful: jobs already inside their warmup window or mid-send
+run to completion (bounded by `-lead`); everything still waiting stays
+pending in the store and re-arms at the next start.
 
-    ... SCHEDULED job=7f3a... msgid=<...@legalmail.it> fire=2026-07-04 15:00:00.000000 +0200 (in 2m0s)
+Health check from anywhere:
+
+    ./gomailer -ping
+    ... daemon on /var/lib/gomailer/gomailer.sock: protocol 2, 3 job(s) pending
+
+## Schedule a mail
+
+    ./gomailer -at "15:00:00" -to dest@pec.it -subject test -body "hello"
+    ./gomailer -in 2m    -to dest@pec.it -subject test -body "hello"
+    ./gomailer -in 2m    -to dest@pec.it -subject test -body "hello" -attach contratto.pdf   # repeatable
+
+The client resolves the fire time, submits to the daemon and prints the
+acknowledgment — the job is **persisted by the daemon before it is
+acknowledged**, with a pre-generated `Message-ID`, so you can correlate it
+with the recipient inbox and the ricevuta. The daemon's log carries µs
+timestamps and the full paper trail:
+
+    ... SCHEDULED job=7f3a... msgid=<...@legalmail.it> fire=2026-07-04 15:00:00.000000 +0700 (in 2m0s)
     ... WARM     job=7f3a... session ready in 284ms (2.7s before fire)
-    ... FIRE     job=7f3a... fired=2026-07-04 15:00:00.000312 +0200 lateness=312µs
+    ... FIRE     job=7f3a... fired=2026-07-04 15:00:00.000312 +0700 lateness=312µs
     ... SENT     job=7f3a... send=41ms
 
-**Warmup** (`-lead`, default 5s): this long before the fire time the
-message is built, the crash-safety marker is persisted, and an
+If no daemon answers on the socket, the client persists the job anyway and
+warns: it will fire when the daemon next starts. The submission is
+**idempotent** end to end: the client pre-generates the job ID and reuses it
+for every attempt of one invocation, so a daemon that dies between
+persisting the job and writing the acknowledgment (crash, or SIGTERM
+mid-reply) cannot turn the lost ack into a duplicate certified send — the
+store refuses a second copy with the same ID, and the client's one
+idempotent retry after persisting lets a daemon that came back arm the job
+without ever re-creating it. `-list` works at any time (read-only):
+
+    ./gomailer -list
+    ./gomailer -list -store /var/lib/gomailer/jobs.json
+
+## Timing — the strict constraint
+
+**Warmup** (`-lead`, default 5s — the *floor* of a payload-aware
+window): this long before the fire time — earlier for fat payloads —
+the message is built, the crash-safety marker is persisted, an
 authenticated provider session is opened (measured ~100–300ms against
-the real provider) — so at the fire time only the envelope/data
-round-trips remain. It is best-effort: if the provider is unreachable at
-warmup, or drops the warm session while waiting (detected with a NOOP
-liveness probe *before* any delivery command), the job degrades to a cold
-send at the fire time and never loses its deadline. At most one delivery
-is ever attempted per fire.
-`-lead 0` disables warmup entirely.
+the real provider), and the **whole transaction is staged**: envelope
+and full DATA upload streamed to the provider, then held **one dot
+short of delivery**. At the fire time only the terminating dot (five
+bytes, the delivery act) and the provider's answer remain — a fat send
+commits in one round-trip instead of one full upload. It is best-effort
+("just go"): if the provider is unreachable at warmup, staging fails,
+or the held transaction dies before the dot, the job degrades to a
+cold send at the fire time and never loses its deadline; an upload
+that overruns its window keeps streaming and the dot follows it
+(finish-then-dot, lateness = the overrun). Nothing observable exists
+before the dot — no queue entry, no accettanza, nothing
+recipient-visible (RFC 5321 §4.1.1.4) — so the no-early-deposit floor
+holds with the same causal proof. A failure *at or after the dot*
+(the answer lost) is terminal ambiguity: never auto-resent, verify the
+inbox for the Message-ID. At most one **completed** delivery (one dot)
+is ever attempted per fire. `-lead 0` disables warmup and staging
+entirely.
+
+**Concurrent firing**: the tending loop hands each job to its own runner
+when its warm window opens (or when due); every runner owns its job
+end-to-end — build, session, staging, exact-instant wait, delivery. Jobs
+that share a deadline fire **in parallel**, each over its own session,
+and a slow SMTP send can never delay another job's fire. Only jobs
+inside their warm window are handed off, so concurrency costs one held
+session per imminent fire. A handed-off job is never re-queued: single
+ownership keeps the at-most-one-completed-delivery discipline under
+concurrency.
+
+Timer re-arming is chunked (≤1s arms, each recomputed against the absolute
+deadline — the loop and every runner alike), so wake drift cannot
+accumulate over long scheduling leads: a 24h-lead job fires with the same
+sub-millisecond precision as a 2s one, container or bare metal.
+
+All validation happens at **scheduling** time (empty body, missing
+recipients, `From` ≠ certified identity, deadline in the past are all
+rejected immediately — by the daemon, and the error travels back to the
+client) — a typo must never surface minutes later at fire time.
 
 Human-side verification: compare the logged fire instant with the message
 `Date:` header and the inbox/ricevuta arrival time. Keep the machine
 NTP-synced (`timedatectl`) for meaningful numbers.
 
-Timer re-arming is chunked (≤1s arms, each recomputed against the absolute
-deadline), so wake drift cannot accumulate over long scheduling leads: a
-24h-lead job fires with the same sub-millisecond precision as a 2s one,
-container or bare metal.
-
-All validation happens at **scheduling** time (empty body, missing
-recipients, `From` ≠ certified identity, deadline in the past are all
-rejected immediately) — a typo must never surface minutes later at fire
-time.
-
 ## Survive reboot
-
-    ./gomailer                 # resume mode: fires everything pending in the store
-    ./gomailer -list           # inspect the store: states, timing, errors
-    ./gomailer -list -store /var/lib/gomailer/jobs.json
 
 | Situation | Behavior |
 |---|---|
-| Reboot **before** fire time | resume mode re-arms the job → still fires **on time** |
+| Reboot **before** fire time | the daemon re-arms the job at boot → still fires **on time** |
 | Machine down **at** fire time | job fires immediately at restart, logged `FIRED <delay> LATE` |
+| Daemon stopped, then restarted | same as reboot: pending jobs re-arm; jobs that were warming or mid-send complete before the daemon exits |
 | Crash **during** the SMTP send | job marked `failed: interrupted during send`, **never auto-resent** (a duplicate PEC is worse) — verify the recipient inbox for the logged Message-ID |
-
-Install [gomailer.service](gomailer.service) (systemd) for automatic
-resume after reboot; it reads `PEC_PASSWORD` from `/etc/gomailer.env`.
+| Daemon down when a client schedules | job persisted anyway; fires when the daemon next starts (the client warns loudly) |
 
 ## The store
 
-A single human-readable JSON file (default `gomailer-jobs.json`), mode
-0600 — it contains the mailbox credentials, so keep it private. Every
-state transition rewrites it atomically (temp file → fsync → rename), and
-completed jobs are kept as history:
+A slim human-readable JSON index (default `gomailer-jobs.json`), mode
+0600 — it contains the mailbox credentials of the jobs still waiting to
+fire (terminal rows are stripped of theirs), so keep it private — plus
+one write-once blob per job under `<store>.blobs/` next to it (a
+directory named after the index, like the `.lock`/`.runlock` sidecars),
+holding that
+job's body and attachments, referenced by name and anchored by a
+sha256 that is verified before any byte can reach the wire. Every state
+transition rewrites the INDEX atomically (temp file → fsync → rename);
+index rewrites are O(rows), never O(payload) — the fat workload made
+whole-file rewrites of an inline-payload history the dominant growing
+latency, so the payload moved out. Payload blobs live **only while the
+job can still fire**: the terminal persist that records sent/failed
+also releases the blob (rows first, then the file — crash-safe in both
+directions), keeping the row's sha256 as the permanent fingerprint of
+what crossed the wire. The ROW is the permanent record:
 
     pending → inflight → sent | failed
 
+**Conserving the payload originals for legal purposes is the sender's
+responsibility, not gomailer's** — a ricevuta `breve` binds its hashes
+to bytes the sender must keep (DM 2/11/2005), so keep your own copy of
+what you send. `-keep-payloads` restores the keep-forever behavior for
+the conservative operator.
+
+Two sidecar files implement the process discipline: `<store>.runlock`
+(the firing right, held for the daemon's lifetime) and `<store>.lock`
+(serializes mutations across processes). The daemon is the only writer
+while it runs; scheduling clients write directly only in the
+daemon-unreachable fallback — safely, under the mutation lock.
+
 The future 24/7 service will require jobs to be scheduled at least 24h in
 advance: that is already enforced by `-min-lead 24h` (rejected at
-scheduling time, so a job with a deadline already in the past cannot
-exist by construction).
+scheduling time, so a job with a deadline already in the past cannot exist
+by construction). `-min-lead`, `-lead` and `-max-payload` are daemon-side
+policies; they apply wherever the firing happens. `-max-payload`
+(default 70 MB, `0` disables) mirrors the default provider's guaranteed
+attachment bound, so a message the provider will not carry is rejected
+at scheduling time, not failed at fire time; recipient lists are capped
+at 1000 per send for the same reason.
+
+## Socket protocol (local automation)
+
+Clients and the daemon speak one JSON request/response exchange per
+connection over the Unix socket (default `gomailer.sock` next to the
+store; `-sock` to override; owner-only, 0600 — requests carry mailbox
+credentials):
+
+    {"op":"schedule","job_id":"<client-generated id>","fire_at":"2026-07-04T15:00:00+02:00","config":{...},"content":{...}}
+    {"op":"ping"}
+
+`schedule` answers `{"ok":true,"job":{"id":...,"message_id":...,"fire_at":...,"state":"pending"}}`
+or `{"ok":false,"error":"..."}` (the daemon's own validation message);
+`ping` answers with the protocol version and the pending count
+(`gomailer -ping` is its CLI form). The protocol is local-only by design;
+the store remains the integration point for everything else.
+
+**Idempotent submit (protocol 2).** `job_id` is the client-generated
+idempotency key: a `schedule` whose `job_id` is already persisted converges
+on that job (same ack, no duplicate) — and re-arms it if it is pending and
+no live firing loop holds it. Terminal jobs are returned untouched (`state`
+reports which): a replay can never re-send a certified message. Clients
+and daemons should be upgraded together; a mixed pair still works, but only
+the matching pair gets the no-duplicate guarantee on a lost ack.
