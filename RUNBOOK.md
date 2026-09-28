@@ -12,6 +12,8 @@ Message-IDs will differ; the shapes are exactly what you will see.
 
 | Task | Command |
 |---|---|
+| Install / upgrade | `sudo ./install.sh` (idempotent; restarts a running daemon) |
+| Uninstall | `sudo ./uninstall.sh` (keeps the evidence store; `--purge-state` to also delete it) |
 | Build | `go build -o gomailer .` |
 | Run the daemon | `gomailer -daemon` (systemd in production) |
 | Health check | `gomailer -ping` |
@@ -22,6 +24,15 @@ Message-IDs will differ; the shapes are exactly what you will see.
 | Stop the daemon | `systemctl stop gomailer` (graceful) |
 
 ## 2. Install & first start
+
+    sudo ./install.sh
+
+That one command runs the whole sequence below — build, install the
+binary, unit and sysusers conf, create the service user, enable, start.
+It is idempotent, so re-running it is safe — and the re-run IS the
+upgrade path: a running daemon is restarted, which drains in-flight
+sends gracefully (§8's stop discipline) instead of leaving a
+half-installed binary. For the record, what it does:
 
     go build -o gomailer .
     sudo install -m755 gomailer /usr/local/bin/gomailer
@@ -89,6 +100,20 @@ execs anything, which is arbitrary code as gomailer; Tier 2 allows the
 binary directly and carries the password via the per-command `env_keep`.
 For a burst of interactive scheduling, `sudo -u gomailer -s` also works
 (the nologin shell blocks `sudo -i`, not `sudo -s`).
+
+### Uninstall
+
+    sudo ./uninstall.sh
+
+Reverses the install: stops the daemon (gracefully — a send in flight
+finishes its commit, never a mid-send kill), disables the unit, removes
+the binary, unit and sysusers conf, and reloads systemd. **The state
+dir is KEPT**: `/var/lib/gomailer` is the evidence store (§6) and carries
+the credentials of jobs still pending. `--purge-state` deletes it too —
+it asks for a typed confirmation; `--purge-state --yes` confirms
+non-interactively. The `gomailer` user/group and `/etc/gomailer.env`
+are left in place (an unused system account is harmless; deleting
+accounts is riskier than leaving them).
 
 ## 3. The daemon: run, check, stop
 
