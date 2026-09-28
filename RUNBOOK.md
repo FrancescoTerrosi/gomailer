@@ -12,6 +12,8 @@ Message-IDs will differ; the shapes are exactly what you will see.
 
 | Task | Command |
 |---|---|
+| Install / upgrade | `sudo ./install.sh` (idempotent; restarts a running daemon) |
+| Uninstall | `sudo ./uninstall.sh` (keeps the evidence store; `--purge-state` to also delete it) |
 | Build | `go build -o gomailer .` |
 | Run the daemon | `gomailer -daemon` (systemd in production) |
 | Health check | `gomailer -ping` |
@@ -24,6 +26,18 @@ Message-IDs will differ; the shapes are exactly what you will see.
 ## 2. Install & first start
 
     go build -o gomailer .
+    sudo ./install.sh
+
+Build once on any machine with the Go toolchain (`go build -o gomailer .`),
+then install from the repository root. `install.sh` installs the
+pre-built binary, the unit and the sysusers conf, creates the service
+user, enables and starts the daemon — no Go toolchain on the target
+box, no network, nothing downloaded. It is idempotent, so re-running it
+is safe — and the re-run IS the upgrade path (build the new binary,
+re-run): a running daemon is restarted, which drains in-flight sends
+gracefully (§8's stop discipline) instead of leaving a half-installed
+binary. For the record, what it does:
+
     sudo install -m755 gomailer /usr/local/bin/gomailer
     sudo install -m644 gomailer.service /etc/systemd/system/gomailer.service
     sudo install -D -m644 gomailer.sysusers.conf /etc/sysusers.d/gomailer.conf
@@ -89,6 +103,20 @@ execs anything, which is arbitrary code as gomailer; Tier 2 allows the
 binary directly and carries the password via the per-command `env_keep`.
 For a burst of interactive scheduling, `sudo -u gomailer -s` also works
 (the nologin shell blocks `sudo -i`, not `sudo -s`).
+
+### Uninstall
+
+    sudo ./uninstall.sh
+
+Reverses the install: stops the daemon (gracefully — a send in flight
+finishes its commit, never a mid-send kill), disables the unit, removes
+the binary, unit and sysusers conf, and reloads systemd. **The state
+dir is KEPT**: `/var/lib/gomailer` is the evidence store (§6) and carries
+the credentials of jobs still pending. `--purge-state` deletes it too —
+it asks for a typed confirmation; `--purge-state --yes` confirms
+non-interactively. The `gomailer` user/group and `/etc/gomailer.env`
+are left in place (an unused system account is harmless; deleting
+accounts is riskier than leaving them).
 
 ## 3. The daemon: run, check, stop
 

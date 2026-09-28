@@ -1,13 +1,13 @@
 # gomailer systemd unit — THE daemon: the single process that fires jobs.
 #
-# Install:
-#   go build -o gomailer .
-#   sudo install -m755 gomailer /usr/local/bin/gomailer
-#   sudo install -m644 gomailer.service /etc/systemd/system/gomailer.service
-#   sudo install -D -m644 gomailer.sysusers.conf /etc/sysusers.d/gomailer.conf
-#   sudo systemd-sysusers                # creates the gomailer user/group
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable --now gomailer
+# Install / upgrade:  go build -o gomailer .  (on a machine with the Go
+# toolchain — the installer downloads and builds nothing), then from the
+# repository:  sudo ./install.sh  — installs the pre-built binary, this
+# unit and the service user (the RUNBOOK §2 sequence; idempotent — a
+# running daemon is restarted to pick up the new binary, draining
+# in-flight sends first).
+# Uninstall:          sudo ./uninstall.sh — keeps /var/lib/gomailer (the
+# evidence store) unless --purge-state.
 #
 # The daemon loads the store at boot and re-arms every pending job: a reboot
 # BEFORE a job's FireAt costs nothing (it still fires exactly on time); only
