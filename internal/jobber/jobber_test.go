@@ -1264,3 +1264,56 @@ func TestWarmLeadZeroDisablesStaging(t *testing.T) {
 		t.Fatalf("state = %q, want sent", jobs[0].State)
 	}
 }
+
+// TestQueueOrderedByWindowOpening pins the queue's key: the pending
+// queue is ordered by WHEN EACH JOB'S WARM WINDOW OPENS, not by FireAt.
+// The inversion is the point: a fat job scheduled to fire LATER (deep
+// in fire-time order) can open its window EARLIER — under a fire-time
+// order a head-only tender would bury it behind the thin job and hand
+// it off late, shrinking its hold into an overrun; under the window
+// order it IS the head, and the dispatch loop is O(1).
+func TestQueueOrderedByWindowOpening(t *testing.T) {
+	s := NewScheduler(testStore(t))
+	base := time.Now().Add(time.Hour)
+
+	// A thin job at base (window = connect+envelope+hold) and a 70MB
+	// job firing 20s later: the fat window opens EARLIER than the thin
+	// one (its upload estimate alone outgrows the 20s gap).
+	thin := Job{
+		ID:           "thin",
+		FireAt:       base,
+		CreatedAt:    base,
+		PayloadBytes: 100,
+	}
+	fat := Job{
+		ID:           "fat",
+		FireAt:       base.Add(20 * time.Second),
+		CreatedAt:    base.Add(time.Second),
+		PayloadBytes: 70 * 1000 * 1000,
+	}
+	thinWS, fatWS := s.windowStart(thin), s.windowStart(fat)
+	if !fat.FireAt.After(thin.FireAt) {
+		t.Fatal("the fixture must keep fat LATER in fire-time order")
+	}
+	if !fatWS.Before(thinWS) {
+		t.Fatalf("the inversion under test must hold: fat window %v must open before thin window %v", fatWS, thinWS)
+	}
+
+	var q SortedQueue
+	q.InsertFunc(thin, s.windowLess)
+	q.InsertFunc(fat, s.windowLess)
+	if len(q) != 2 || q[0].ID != "fat" {
+		t.Fatalf("queue head = %q, want the fat job (earliest window, not earliest FireAt)", q[0].ID)
+	}
+
+	// Tie-break: same window ⇒ FireAt, then CreatedAt (FIFO within a
+	// deadline cluster).
+	a := Job{ID: "a", FireAt: base, CreatedAt: base.Add(time.Second), PayloadBytes: 100}
+	b := Job{ID: "b", FireAt: base, CreatedAt: base, PayloadBytes: 100}
+	var q2 SortedQueue
+	q2.InsertFunc(a, s.windowLess)
+	q2.InsertFunc(b, s.windowLess)
+	if q2[0].ID != "b" || q2[1].ID != "a" {
+		t.Fatalf("FIFO tie-break broken: head=%q next=%q, want b then a (CreatedAt order)", q2[0].ID, q2[1].ID)
+	}
+}

@@ -369,11 +369,14 @@ holding the terminating dot. The prefire prohibition applies to
   and the answer read (60s) — all inside TimeoutStopSec=90s.
 - Scheduler (scheduler.go): payload-aware warm windows (`stagedLead`:
   connect+auth + RCPT round-trips + payload/UplinkRate + split-row blob
-  reassembly (defaultHydrateRate) + HoldBudget, floored at `-lead`); queue-wide dispatch scan (a fat job deep in the queue can
-  carry the earliest window); staging in prewarm; the "just go" fire paths
-  (finish-then-dot on overrun, cold full send at the fire time when the dot
-  write fails, terminal verify when the dot left). Logged `STAGED upload=…`
-  is the uplink baseline item 5 wants.
+  reassembly (defaultHydrateRate) + HoldBudget, floored at `-lead`); the
+  pending queue is ORDERED BY WINDOW OPENING (`windowLess`: the head is
+  the next job to warm — O(1) dispatch, no queue-wide scan; a fat job
+  opening long before a thin one scheduled to fire earlier is at the
+  front, where a fire-time order would bury it); staging in prewarm; the
+  "just go" fire paths (finish-then-dot on overrun, cold full send at
+  the fire time when the dot write fails, terminal verify when the dot
+  left). Logged `STAGED upload=…` is the uplink baseline item 5 wants.
 - `StageOn` CONSUMES the session on failure (closes it): a failed staging
   leaves a half-open envelope — and, from DATA on, an abandoned dot-writer
   that textproto auto-closes (writes the DOT) on the next command — so

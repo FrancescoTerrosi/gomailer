@@ -212,7 +212,11 @@ type warmState struct {
 // The tending loop owns the queue and nothing else: it sleeps toward the
 // next hand-off instant and hands each job to a dedicated runner
 // goroutine when its warm window opens (payload-aware, WarmLead is the
-// floor — see stagedLead) or when it is due. Runners are fully independent: each builds its message,
+// floor — see stagedLead) or when it is due. The pending queue is
+// ORDERED BY WINDOW OPENING (windowLess), so the head IS the next job
+// to warm: dispatch is O(1), and a fat job whose window opens long
+// before a thin one scheduled to fire earlier sits at the front, where
+// a fire-time order would bury it. Runners are fully independent: each builds its message,
 // opens its own provider session, waits out its own chunked timer to the
 // exact fire instant and delivers. Jobs that share a deadline fire
 // CONCURRENTLY, each over its own session, and a slow SMTP send can never
@@ -361,6 +365,39 @@ func (s *Scheduler) stagedLead(j Job) time.Duration {
 		lead = s.WarmLead
 	}
 	return lead
+}
+
+// windowStart is when the job's warm window opens — FireAt minus its
+// lead (stagedLead), or FireAt itself when there is no window (cold:
+// the due instant is the dispatch trigger). THE SCHEDULER'S QUEUE KEY:
+// windowLess orders the pending queue by this instant, so the head is
+// always the next job to warm — the dispatch loop needs no queue-wide
+// scan, and a fat job deep in FireAt order can never have its window
+// open late (the two orders differ exactly there: lead is per-job).
+// The key is stable for the process lifetime — stagedLead's inputs are
+// the scheduler's fixed config plus per-row fields snapshotted at
+// scheduling (PayloadBytes, recipients) — so an ordering computed at
+// insert time cannot rot.
+func (s *Scheduler) windowStart(j Job) time.Time {
+	lead := s.stagedLead(j)
+	if lead <= 0 {
+		return j.FireAt // no window: dispatch when due
+	}
+	return j.FireAt.Add(-lead)
+}
+
+// windowLess orders jobs by window opening (the queue's key), breaking
+// ties by FireAt and then CreatedAt (FIFO within a deadline cluster —
+// cluster members with different payloads open different windows and
+// still dispatch together when each arrives).
+func (s *Scheduler) windowLess(a, b Job) int {
+	if cmp := s.windowStart(a).Compare(s.windowStart(b)); cmp != 0 {
+		return cmp
+	}
+	if cmp := a.FireAt.Compare(b.FireAt); cmp != 0 {
+		return cmp
+	}
+	return a.CreatedAt.Compare(b.CreatedAt)
 }
 
 // Schedule validates and persists a new job, then arms the run loop when
@@ -525,16 +562,15 @@ func (s *Scheduler) ScheduleWithID(id string, cfg mailer.MailConfig, content *ma
 	// terminal persist releases the payload THROUGH that reference (the
 	// row keeps the digest as its fingerprint). Queueing the bare copy
 	// would settle the row without ever releasing — a leaked blob and a
-	// fingerprintless row.
-	s.pending.Insert(existing)
+	// fingerprintless row. The queue is ordered by window opening
+	// (windowLess), so this insertion lands wherever its window puts it.
+	s.pending.InsertFunc(existing, s.windowLess)
 	s.mu.Unlock()
-	// Always hint the loop, not only for a new head: warm windows are
-	// payload-aware, so a job deep in the queue can carry the EARLIEST
-	// window (a fat job opens long before a thin head) — the loop must
-	// re-evaluate the whole queue on every new pending job. The hint may
-	// drop; every consumer re-reads the authoritative queue after
-	// waking, so a dropped hint only delays the re-evaluation to the
-	// next one, never loses it.
+	// Always hint the loop: it sleeps toward the CURRENT head's window,
+	// and the new job's window can only make that instant earlier (the
+	// key IS the order). The hint may drop; every consumer re-reads the
+	// authoritative queue after waking, so a dropped hint only delays
+	// the re-evaluation to the next one, never loses it.
 	select {
 	case s.wake <- struct{}{}:
 	default:
@@ -566,7 +602,7 @@ func (s *Scheduler) replay(j Job) Job {
 	}
 	arm := !running && !queued && j.State == StatePending
 	if arm {
-		s.pending.Insert(j)
+		s.pending.InsertFunc(j, s.windowLess)
 	}
 	s.mu.Unlock()
 
@@ -575,8 +611,9 @@ func (s *Scheduler) replay(j Job) Job {
 			j.ID, j.MessageID, j.State)
 		return j
 	}
-	// Always hint (see ScheduleWithID): a re-armed job can carry the
-	// earliest warm window even when it is not the queue's head.
+	// Always hint (see ScheduleWithID): the re-armed job's window can
+	// open before the current head's — the loop sleeps toward the OLD
+	// head's window and must re-peek.
 	select {
 	case s.wake <- struct{}{}:
 	default:
@@ -709,7 +746,7 @@ func (s *Scheduler) run(ctx context.Context, serve bool, ready func()) error {
 	for _, j := range jobs {
 		switch j.State {
 		case StatePending:
-			pending.Insert(j)
+			pending.InsertFunc(j, s.windowLess)
 		case StateSent:
 			sent++
 		case StateFailed:
@@ -749,55 +786,46 @@ func (s *Scheduler) run(ctx context.Context, serve bool, ready func()) error {
 			continue
 		}
 
-		// Hand-off decision, queue-wide: dispatch every job whose warm
-		// window has opened (or that is due). Windows are payload-aware
-		// (stagedLead), so a fat job deep in the queue can open long
-		// BEFORE the head's — a head-only loop would dispatch it late and
-		// shrink its hold into an overrun. Dispatching EAGERLY — rather
-		// than only while the window is still strictly in the future — is
-		// what lets every job sharing a deadline get its own warm session:
-		// under the old rule the loop handed the first job off at the
-		// window opening, then judged every follower — evaluated a
-		// microsecond later — "already past the window" and fired it cold
-		// at FireAt. Warmup is still skipped when too little time remains
-		// to finish it before the deadline (a job scheduled inside its
-		// window, or catching up) — decided from the remaining time, not
-		// from which side of the window edge the loop happens to be on.
+		// Hand-off decision, head-ordered: the queue is ordered by window
+		// OPENING (windowLess), so the head IS the next job to warm — no
+		// queue-wide scan, no second key to reconcile (a fat job opening
+		// long before a thin one scheduled to fire earlier is, by the same
+		// key, at the front, where a fire-time-ordered queue would have
+		// buried it). Dispatch every head whose window — or, cold, whose
+		// FireAt — has arrived; the first head that is not due is, by the
+		// order, the earliest future window: the sleep target, O(1).
+		// Warmup is still decided per job from the time remaining (a job
+		// scheduled inside its window, or catching up, fires cold —
+		// min(minWarmBudget, lead/2)), and every job sharing a deadline
+		// still gets its own warm session: cluster members sit at the
+		// front together as each one's window arrives.
 		now := time.Now()
-		var nextWindow time.Time
 		dispatched := 0
-		for i := 0; i < len(s.pending); {
-			j := s.pending[i]
+		for len(s.pending) > 0 && !now.Before(s.windowStart(s.pending[0])) {
+			j := s.pending[0]
 			lead := s.stagedLead(j)
-			windowStart := j.FireAt
-			if lead > 0 {
-				windowStart = j.FireAt.Add(-lead)
-			}
-			windowOpen := lead > 0 && !now.Before(windowStart)
-			if windowOpen || !now.Before(j.FireAt) {
-				warm := lead > 0 && j.FireAt.Sub(now) >= min(minWarmBudget, lead/2)
-				s.pending = slices.Delete(s.pending, i, i+1)
-				s.active[j.ID] = struct{}{}
-				go s.runJob(j, warm)
-				dispatched++
-				continue // re-examine the slot: the queue shifted under it
-			}
-			if nextWindow.IsZero() || windowStart.Before(nextWindow) {
-				nextWindow = windowStart
-			}
-			i++
+			warm := lead > 0 && j.FireAt.Sub(now) >= min(minWarmBudget, lead/2)
+			s.pending = slices.Delete(s.pending, 0, 1)
+			s.active[j.ID] = struct{}{}
+			go s.runJob(j, warm)
+			dispatched++
+		}
+		var nextWindow time.Time
+		if len(s.pending) > 0 {
+			nextWindow = s.windowStart(s.pending[0]) // the key IS the order: head = earliest window
 		}
 		if dispatched > 0 {
 			s.mu.Unlock()
-			continue // re-scan: state may have changed while dispatching
+			continue // re-evaluate with a fresh now: the head changed under the dispatches
 		}
 		s.mu.Unlock()
 
-		// No window is open yet: sleep until the earliest one does and
-		// re-evaluate. The wait is chunked and recomputed against the
-		// absolute instant (see maxArm); an earlier submission wakes it
-		// early to re-arm (the wake hint may drop, so every path re-reads
-		// the queue after waking).
+		// No window is open yet: sleep until the head's does and re-evaluate.
+		// The wait is chunked and recomputed against the absolute instant
+		// (see maxArm); an earlier submission — which can only move the
+		// head's window EARLIER (the key is the order) — wakes it via the
+		// hint (the hint may drop, so every path re-reads the queue after
+		// waking).
 		if err := s.waitForUntil(ctx, nextWindow); err != nil {
 			return s.stop(err)
 		}
