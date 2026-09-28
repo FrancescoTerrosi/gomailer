@@ -7,7 +7,8 @@ package jobber
 // loss), the orphan sweep, blob-name safety for caller-choosable IDs,
 // the per-store blob directory (named after the store file, so stores
 // sharing a state directory cannot destroy each other's evidence),
-// and adoption of the first builds' shared blob directory.
+// adoption of the first builds' shared blob directory, and the terminal
+// release policy (payload bytes live until the job settles).
 
 import (
 	"crypto/sha256"
@@ -171,7 +172,12 @@ func TestHydrateFailureIsTerminal(t *testing.T) {
 // every row, exactly as every gomailer before the split persisted it —
 // envelope keys lowercase too ("version"/"jobs"), the shape the v1
 // storeFile's json tags produced.
-func writeV1Store(t *testing.T, path, id, body string, att []byte) {
+// writeV1Store hand-writes a version-1 file: the whole payload inline in
+// every row, exactly as every gomailer before the split persisted it —
+// envelope keys lowercase too ("version"/"jobs"), the shape the v1
+// storeFile's json tags produced. state lets a row arrive settled
+// (pre-split stores kept terminal rows fat too).
+func writeV1Store(t *testing.T, path, id, body string, att []byte, state JobState) {
 	t.Helper()
 	row := map[string]any{
 		"ID":        id,
@@ -197,7 +203,7 @@ func writeV1Store(t *testing.T, path, id, body string, att []byte) {
 			"Username": "sender@pec.test",
 			"Password": "secret",
 		},
-		"State": "pending",
+		"State": string(state),
 	}
 	buf, err := json.MarshalIndent(map[string]any{"version": 1, "jobs": []any{row}}, "", "  ")
 	if err != nil {
@@ -216,7 +222,7 @@ func TestMigrateFromV1InlineStore(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "jobs.json")
 	att := []byte("the old contract bytes")
-	writeV1Store(t, path, "legacy", "the old body", att)
+	writeV1Store(t, path, "legacy", "the old body", att, StatePending)
 
 	store, err := OpenStore(path)
 	if err != nil {
@@ -305,7 +311,7 @@ func TestSaveNeverDropsPayload(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "jobs.json")
 	att := []byte("legacy evidence bytes")
-	writeV1Store(t, path, "legacy", "the old body", att)
+	writeV1Store(t, path, "legacy", "the old body", att, StatePending)
 
 	store, err := OpenStore(path)
 	if err != nil {
@@ -721,5 +727,278 @@ func TestContentOfIsLockFreeUnderWriters(t *testing.T) {
 	case err := <-errCh:
 		t.Fatal(err)
 	default:
+	}
+}
+
+// TestTerminalRelease: the payload blob lives exactly as long as the job
+// can still fire. A settled row persists WITHOUT its reference — keeping
+// the sha256 fingerprint and PayloadBytes — and the file is deleted;
+// ContentOf on the released row refuses loudly instead of returning
+// empty bytes. Both terminal states release.
+func TestTerminalRelease(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state JobState
+	}{
+		{"sent", StateSent},
+		{"failed", StateFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := testStore(t)
+			j := splitTestJob("settle", "the body")
+			j.Content = fatContent("the body", []byte("fat attachment bytes"))
+			if _, created, err := store.AddNew(j); err != nil || !created {
+				t.Fatalf("AddNew: created=%v err=%v", created, err)
+			}
+			row, ok, err := store.GetByID(j.ID)
+			if err != nil || !ok || row.ContentFile == "" {
+				t.Fatalf("pending row must reference its blob: ok=%v err=%v row=%+v", ok, err, row)
+			}
+			blob := row.ContentFile
+
+			// Settle through the Update choke point — what fire, failNow
+			// and boot recovery all call.
+			row.State = tc.state
+			row.Result = &JobResult{FiredAt: time.Now(), Err: "settled in test"}
+			if err := store.Update(row); err != nil {
+				t.Fatalf("Update: %v", err)
+			}
+
+			got, ok, err := store.GetByID(j.ID)
+			if err != nil || !ok {
+				t.Fatalf("GetByID: ok=%v err=%v", ok, err)
+			}
+			if got.ContentFile != "" {
+				t.Fatalf("settled row still references its blob: %q", got.ContentFile)
+			}
+			if got.ContentSHA256 == "" || got.PayloadBytes == 0 {
+				t.Fatalf("settled row must keep the fingerprint: sha=%q bytes=%d", got.ContentSHA256, got.PayloadBytes)
+			}
+			if got.Config.Password != "" {
+				t.Fatal("settled row must be stripped of its credential (the pre-existing choke-point rule)")
+			}
+			if _, err := os.Stat(store.blobPath(blob)); !os.IsNotExist(err) {
+				t.Fatalf("released file must be deleted: %v", err)
+			}
+			if _, err := store.ContentOf(got); err == nil || !strings.Contains(err.Error(), "released") {
+				t.Fatalf("ContentOf on a released row must refuse loudly, got %v", err)
+			}
+			// The release deleted its own file: nothing was orphaned.
+			if swept, err := store.SweepOrphanBlobs(); err != nil || swept != 0 {
+				t.Fatalf("sweep = %d err=%v, want 0", swept, err)
+			}
+		})
+	}
+}
+
+// TestReleaseNeverTouchesUnfiredPayloads: pending and inflight rows keep
+// their payloads through arbitrary rewrites — the never-drop invariant
+// now reads "no write path may drop the payload of a job that has not
+// yet fired".
+func TestReleaseNeverTouchesUnfiredPayloads(t *testing.T) {
+	store := testStore(t)
+	pending := splitTestJob("pending-keep", "pending body")
+	pending.Content = fatContent("pending body", []byte("pending bytes"))
+	if _, created, err := store.AddNew(pending); err != nil || !created {
+		t.Fatalf("AddNew: %v", err)
+	}
+	inflight := splitTestJob("inflight-keep", "inflight body")
+	inflight.Content = fatContent("inflight body", []byte("inflight bytes"))
+	inflight.State = StateInflight
+	if err := store.Add(inflight); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	// An unrelated write rewrites the whole set: unfired rows must come
+	// back with their payloads intact.
+	if err := store.Add(splitTestJob("unrelated", "unrelated")); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	for _, id := range []string{"pending-keep", "inflight-keep"} {
+		j, ok, err := store.GetByID(id)
+		if err != nil || !ok || j.ContentFile == "" {
+			t.Fatalf("unfired row %s lost its blob reference: ok=%v err=%v row=%+v", id, ok, err, j)
+		}
+		full, err := store.ContentOf(j)
+		if err != nil || !strings.Contains(full.Body, " body") {
+			t.Fatalf("unfired row %s payload = %+v err=%v, want intact", id, full, err)
+		}
+	}
+}
+
+// TestKeepPayloadsEscapeHatch: with KeepPayloads set, settled rows keep
+// their blobs (the pre-policy behavior) — the conservative operator's
+// opt-out, wired to the -keep-payloads flag.
+func TestKeepPayloadsEscapeHatch(t *testing.T) {
+	store := testStore(t)
+	store.KeepPayloads = true
+	j := splitTestJob("kept", "kept body")
+	j.Content = fatContent("kept body", []byte("kept bytes"))
+	if _, created, err := store.AddNew(j); err != nil || !created {
+		t.Fatalf("AddNew: %v", err)
+	}
+	row, _, _ := store.GetByID(j.ID)
+	row.State = StateSent
+	if err := store.Update(row); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	got, _, _ := store.GetByID(j.ID)
+	if got.ContentFile == "" {
+		t.Fatal("KeepPayloads: settled row must keep its blob reference")
+	}
+	full, err := store.ContentOf(got)
+	if err != nil || full.Body != "kept body" {
+		t.Fatalf("KeepPayloads: payload must round-trip: %+v %v", full, err)
+	}
+	if _, err := os.Stat(store.blobPath(got.ContentFile)); err != nil {
+		t.Fatalf("KeepPayloads: blob file must exist: %v", err)
+	}
+}
+
+// TestReleaseTerminalPayloadsBootEviction: rows settled by older
+// gomailers still reference their blobs; the boot step brings them under
+// the policy — reference cleared (fingerprint kept), file deleted,
+// unfired rows untouched, idempotent, and gated by KeepPayloads.
+func TestReleaseTerminalPayloadsBootEviction(t *testing.T) {
+	store := testStore(t)
+	// A row settled by an OLDER gomailer: scheduled (blob written), then
+	// settled under keep-forever behavior (KeepPayloads), which is what
+	// the pre-policy releases wrote — terminal WITH its reference.
+	sent := splitTestJob("old-sent", "old body")
+	sent.Content = fatContent("old body", []byte("old bytes"))
+	if _, created, err := store.AddNew(sent); err != nil || !created {
+		t.Fatalf("AddNew: %v", err)
+	}
+	pending := splitTestJob("old-pending", "still fires")
+	pending.Content = fatContent("still fires", []byte("live bytes"))
+	if err := store.Add(pending); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	store.KeepPayloads = true
+	sentRow, ok, err := store.GetByID("old-sent")
+	if err != nil || !ok {
+		t.Fatalf("GetByID: %v", err)
+	}
+	sentRow.State = StateSent
+	if err := store.Update(sentRow); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	store.KeepPayloads = false // boot of the release-aware gomailer
+	sentRow, _, _ = store.GetByID("old-sent")
+	blob := sentRow.ContentFile
+	if blob == "" {
+		t.Fatal("pre-policy settled row must carry its reference")
+	}
+
+	released, err := store.ReleaseTerminalPayloads()
+	if err != nil || released != 1 {
+		t.Fatalf("ReleaseTerminalPayloads = %d err=%v, want 1", released, err)
+	}
+	got, _, _ := store.GetByID("old-sent")
+	if got.ContentFile != "" || got.ContentSHA256 == "" {
+		t.Fatalf("legacy settled row must be released with its fingerprint: %+v", got)
+	}
+	if _, err := os.Stat(store.blobPath(blob)); !os.IsNotExist(err) {
+		t.Fatalf("released legacy file must be deleted: %v", err)
+	}
+	live, _, _ := store.GetByID("old-pending")
+	if live.ContentFile == "" {
+		t.Fatal("pending row must be untouched by the boot eviction")
+	}
+	if full, err := store.ContentOf(live); err != nil || full.Body != "still fires" {
+		t.Fatalf("pending row payload = %+v err=%v, want intact", full, err)
+	}
+
+	// Idempotent: nothing left to release.
+	if released, err := store.ReleaseTerminalPayloads(); err != nil || released != 0 {
+		t.Fatalf("second ReleaseTerminalPayloads = %d err=%v, want 0", released, err)
+	}
+
+	// The escape hatch gates the boot step too: with KeepPayloads, a
+	// row settled through the keep-forever behavior keeps its blob and
+	// the step is a no-op.
+	store.KeepPayloads = true
+	late := splitTestJob("late-settled", "late body")
+	late.Content = fatContent("late body", []byte("late bytes"))
+	if _, created, err := store.AddNew(late); err != nil || !created {
+		t.Fatalf("AddNew: %v", err)
+	}
+	lateRow, _, _ := store.GetByID("late-settled")
+	lateRow.State = StateFailed
+	if err := store.Update(lateRow); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	lateRow, _, _ = store.GetByID("late-settled")
+	if lateRow.ContentFile == "" {
+		t.Fatal("KeepPayloads: settled row must keep its blob")
+	}
+	if released, err := store.ReleaseTerminalPayloads(); err != nil || released != 0 {
+		t.Fatalf("gated ReleaseTerminalPayloads = %d err=%v, want 0", released, err)
+	}
+	lateRow, _, _ = store.GetByID("late-settled")
+	if lateRow.ContentFile == "" {
+		t.Fatal("KeepPayloads: the boot step must not release")
+	}
+}
+
+// TestMigrateSlimsSettledInlineRows: a pre-split store with a SETTLED row
+// still carrying its payload inline: boot migration slims it — the
+// retention policy for settled jobs, not a loss — while pending rows
+// still split and round-trip. Idempotent.
+func TestMigrateSlimsSettledInlineRows(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "jobs.json")
+	att := []byte("settled inline bytes")
+	writeV1Store(t, path, "old-settled", "the settled body", att, StateSent)
+
+	store, err := OpenStore(path)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	jobs, err := store.Load()
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("Load: err=%v jobs=%d", err, len(jobs))
+	}
+	if jobs[0].Content.Body != "the settled body" {
+		t.Fatalf("pre-migration settled row must load hydrated: %+v", jobs[0].Content)
+	}
+
+	migrated, converted, err := store.Migrate()
+	if err != nil || converted != 0 {
+		t.Fatalf("Migrate: converted=%d err=%v, want 0 splits (nothing left to fire)", converted, err)
+	}
+	if migrated[0].Content.Body != "" || len(migrated[0].Content.Attachments) != 0 {
+		t.Fatalf("settled row must be slimmed by the policy: %+v", migrated[0].Content)
+	}
+	// The index lost the inline bytes: the base64 payload is gone.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), base64.StdEncoding.EncodeToString(att)) {
+		t.Fatal("settled row's inline payload survived migration")
+	}
+	// No blob was written for it (nothing to fire, nothing to keep).
+	entries, err := os.ReadDir(store.blobDir())
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("reading blob dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("blobs after migration = %d, want 0", len(entries))
+	}
+
+	// Idempotent: an already-slim settled row has nothing to drop.
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, converted, err := store.Migrate(); err != nil || converted != 0 {
+		t.Fatalf("second Migrate: converted=%d err=%v, want 0", converted, err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatal("an empty migration rewrote the store")
 	}
 }

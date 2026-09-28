@@ -165,10 +165,19 @@ sha256 that is verified before any byte can reach the wire. Every state
 transition rewrites the INDEX atomically (temp file → fsync → rename);
 index rewrites are O(rows), never O(payload) — the fat workload made
 whole-file rewrites of an inline-payload history the dominant growing
-latency, so the payload moved out. Completed jobs are kept as history
-(the index is the audit log, the blobs are the evidence):
+latency, so the payload moved out. Payload blobs live **only while the
+job can still fire**: the terminal persist that records sent/failed
+also releases the blob (rows first, then the file — crash-safe in both
+directions), keeping the row's sha256 as the permanent fingerprint of
+what crossed the wire. The ROW is the permanent record:
 
     pending → inflight → sent | failed
+
+**Conserving the payload originals for legal purposes is the sender's
+responsibility, not gomailer's** — a ricevuta `breve` binds its hashes
+to bytes the sender must keep (DM 2/11/2005), so keep your own copy of
+what you send. `-keep-payloads` restores the keep-forever behavior for
+the conservative operator.
 
 Two sidecar files implement the process discipline: `<store>.runlock`
 (the firing right, held for the daemon's lifetime) and `<store>.lock`

@@ -131,17 +131,34 @@ provider-mirrored; `0` disables) and the ≤1000 recipient cap now live
 in `ScheduleWithID`, with `-max-payload` as a daemon-side policy flag.
 What remains in this item is only the SQLite endgame.
 
-**Coupling with receipt type (2026-09-27 note)**: with ricevuta `breve`,
-the consegna attests delivery via headers + DIGEST of the original —
-matching that digest at dispute time requires the original bytes, which
-exist only in the stored job (body + attachments, kept as history by
-design — in the per-job blob since the split store, anchored by the
-row's `ContentSHA256`). Any store-slimming endgame (blob eviction,
-SQLite blobs, cleanup) must NOT evict payloads of jobs whose receipts
-are digest-based (`breve`), or it silently destroys the verification half
-of the legal chain. Retention policy and receipt-type policy are
-coupled — decide together (see item 5). What today reads as bloat is
-also evidence.
+**Coupling with receipt type (2026-09-27; rewritten 2026-09-28 — the
+retention policy shipped)**: with ricevuta `breve`, the consegna carries
+the original headers and body with each attachment replaced by its
+SHA-1 hash — and the Regole Tecniche put the conservation duty on the
+SENDER: "è indispensabile che il mittente conservi gli originali
+immodificati degli allegati, a cui gli hash fanno riferimento". That is
+the sender's legal duty, not the tool's: gomailer is not a compliance
+archive, and as of release-at-terminal it does not pretend to be one.
+The tool's own commitments are (a) payload bytes live from scheduling
+until the job settles — the terminal persist that records the outcome
+releases the blob, keeping the row's sha256 as the permanent
+fingerprint — and (b) nothing is ever deleted silently: the release is
+an explicit, logged, policy-owned event, deletion outside it remains
+the operator's own explicit act (the trim recipe, uninstall
+`--purge-state`). An org that wants gomailer's store to double as its
+conservation copy runs `-keep-payloads` and owns that decision.
+
+**SPEC COUPLING — read before changing at-most-one-send**: the release
+policy assumes the current discipline — a settled job never fires
+again; a re-send is a NEW job with a fresh submission. If a later spec
+lets FAILED jobs be re-fired, re-fire of the SAME row needs bytes that
+have been released: revisit `Store.releasePayload` (the one policy
+seam) before shipping that change — stop releasing failed rows, or
+make re-fire require a fresh submission. Released rows are
+self-describing (`ContentFile == ""` with `ContentSHA256 != ""` — a
+shape no other write path produces) and `ContentOf` refuses them
+loudly, so a future re-fire path fails visibly instead of sending
+empty bytes.
 
 **Shipped (2026-09-27, later still — the split store)**: the fat
 workload turned the whole-file rewrite tax into the dominant GROWING
@@ -158,15 +175,28 @@ any byte can reach the wire, and `PayloadBytes` rides the row so
 `stagedLead` sizes windows without the payload in RAM. Version-1 files
 still load and migrate at boot (one blob write per row, ONE slim
 rewrite); the save path carries a never-drop invariant (no write can
-slim a row into evidence loss — the CLI fallback writing into a v1
-file converts it row by row); orphan blobs are swept at boot; and the
+drop the payload of a job that has not yet fired — the CLI fallback
+writing into a v1 file converts it row by row); orphan blobs are swept
+at boot; and the
 blob directory is named after the store file (`<store>.blobs/`), so
 two stores in one state directory can never sweep each other's
-evidence (a boot step adopts the blobs the first split builds kept
+payloads (a boot step adopts the blobs the first split builds kept
 in a shared `blobs/` sibling). Index
 rewrites are O(rows) forever, whatever the payloads. What remains of
 this item is still only the SQLite endgame — now for queryability and
 concurrent writers, not for performance.
+
+**Shipped (2026-09-28 — release at settle)**: the store now keeps
+payload bytes only for the time it needs them to send the email. Both
+terminal persists (sent AND failed — a settled job never fires again
+under the current spec) release the blob through the same
+`Store.Update` choke point that strips credentials: rows first (the
+reference cleared, the digest kept as the fingerprint), then the file
+— crash-safe in both directions, with the boot sweep collecting any
+stray. A boot step brings pre-policy terminal rows under the policy,
+and pre-split settled rows are slimmed by migration instead of
+extracted. The blob directory is bounded by the live queue, not by
+history; `-keep-payloads` is the operator's escape hatch.
 
 ## 3. Credentials: strip at terminal (shipped) + encrypt at rest (designed, not yet built)
 

@@ -70,6 +70,12 @@ type Job struct {
 	// index rewrites are O(rows), never O(payload) — the fat workload
 	// made whole-file rewrites of a 70MB+ history cost seconds per
 	// mutation, right on the warm-window critical path.
+	//
+	// A settled row carries the RELEASED shape: ContentFile == "" with
+	// ContentSHA256 != "" — the payload was released at the terminal
+	// persist (see Store.releasePayload); the digest remains as the
+	// permanent fingerprint of what crossed the wire. No other write
+	// path produces this shape.
 	ContentFile   string
 	ContentSHA256 string
 	PayloadBytes  int64

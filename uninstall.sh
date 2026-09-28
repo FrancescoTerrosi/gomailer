@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # uninstall.sh — remove the gomailer daemon (the reverse of install.sh).
 #
-# The state directory ($STATE_DIR, default /var/lib/gomailer) is LEGAL
-# EVIDENCE: the slim index plus the payload blobs are the completed
-# jobs' originals that a ricevuta-breve dispute verifies against
-# (TODO.md item 3), and pending rows carry the mailbox credentials
-# replayed at fire time. It is therefore KEPT by default — removal is a
-# separate, explicitly confirmed act.
+# The state directory ($STATE_DIR, default /var/lib/gomailer) holds the
+# payload originals of the jobs that have not yet fired (they are
+# released at settle), the permanent row history (the audit log), and
+# the mailbox credentials of pending jobs. Whether anything in it is
+# your conservation copy is YOUR policy — conserving the originals for
+# legal purposes is the sender's duty (DM 2/11/2005), not gomailer's.
+# The directory is therefore KEPT by default — removal is a separate,
+# explicitly confirmed act.
 #
 # The gomailer system user/group (created by systemd-sysusers) and
 # /etc/gomailer.env are left in place: an unused system account is
@@ -32,9 +34,12 @@ uninstall.sh — remove the gomailer daemon (the reverse of install.sh).
 Usage: sudo ./uninstall.sh [--purge-state] [--yes]
 
   (default)     stop + disable the unit, remove the binary, the unit and
-                the sysusers conf. The state dir is KEPT — it is legal
-                evidence (job history + payload blobs) and carries the
-                credentials of jobs still pending.
+                the sysusers conf. The state dir is KEPT — it holds the
+                payload originals of unfired jobs, the permanent row
+                history and the credentials of jobs still pending.
+                Whether it is your conservation copy is your policy
+                (conserving originals is the sender's duty, not
+                gomailer's).
   --purge-state also delete the state dir. Asks for confirmation;
                 combine with --yes to confirm non-interactively.
   --yes         answer the purge confirmation without asking.
@@ -94,7 +99,8 @@ if [[ $purge_state -eq 1 ]]; then
 		rm -rf "$STATE_DIR"
 		say "state deleted"
 	elif [[ -t 0 ]]; then
-		say "$STATE_DIR is LEGAL EVIDENCE (job history + payload blobs) and carries pending credentials."
+		say "$STATE_DIR holds the payload originals of jobs not yet fired, the permanent row history, and pending credentials."
+		say "Whether it is your conservation copy is YOUR policy (conserving originals is the sender's duty — DM 2/11/2005)."
 		say "Archive it first if anything might ever be disputed:"
 		say "  tar -C $(dirname "$STATE_DIR") -czf gomailer-evidence-$(date +%F).tgz $(basename "$STATE_DIR")"
 		printf 'Type PURGE to delete it permanently: '
@@ -110,8 +116,9 @@ if [[ $purge_state -eq 1 ]]; then
 	fi
 else
 	if [[ -e $STATE_DIR ]]; then
-		say "state KEPT at $STATE_DIR — the index plus payload blobs are legally binding evidence,"
-		say "and pending rows carry the mailbox credentials replayed at fire time. Archive it before"
+		say "state KEPT at $STATE_DIR — the payload originals of unfired jobs, the permanent row history, and the"
+		say "credentials of jobs still pending. Whether it is your conservation copy is your policy;"
+		say "conserving the originals for legal purposes is the sender's duty, not gomailer's. Archive it before"
 		say "wiping this machine:"
 		say "  tar -C $(dirname "$STATE_DIR") -czf gomailer-evidence-$(date +%F).tgz $(basename "$STATE_DIR")"
 		say "Remove it explicitly when you are sure:  sudo ./uninstall.sh --purge-state"

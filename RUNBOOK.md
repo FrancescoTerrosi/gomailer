@@ -215,7 +215,8 @@ fire time, so take it seriously:
 
     ... WARNING: no password given (set -pass or $PEC_PASSWORD): the send will fail at auth
 
-Policy flags `-min-lead`, `-lead` and `-max-payload` are **daemon-side**: when
+Policy flags `-min-lead`, `-lead`, `-max-payload` and `-keep-payloads`
+are **daemon-side**: when
 submitting to a running daemon, the daemon's values apply. The future 24/7
 service sets `-min-lead 24h` so a job with a deadline in the past cannot
 exist by construction. `-max-payload` (default **70 MB**, body +
@@ -224,6 +225,11 @@ guarantee — Legalmail certifies delivery only up to 70 MB of attachments
 per message (Manuale Operativo §5.1) — so an oversized submission is
 rejected at scheduling time instead of failing at fire time. Recipients
 are likewise capped at 1000 per send, matching the provider's limit.
+`-keep-payloads` opts out of the retention policy: payload bytes are
+then kept after the job settles too (the pre-policy behavior) — by
+default they are released once the send's outcome is recorded, because
+conserving the originals for legal purposes is the sender's
+responsibility, not gomailer's.
 
 ## 5. Manual operation (no daemon)
 
@@ -284,18 +290,21 @@ is a **slim human-readable JSON index** (mode 0600 — it contains the
 mailbox credentials of the jobs still waiting to fire; terminal rows are
 stripped of theirs) plus one **blob file per job** under `jobs.json.blobs/`
 next to it (the blob directory is named after the store file, so two
-stores in one directory can never destroy each other's evidence),
-holding that job's body and attachments — the payload evidence,
-written once at scheduling and never rewritten. The split is the fix for
-the fat-workload trap where every mutation rewrote every byte ever
-stored (a 70MB index cost seconds per write, on the warm window's
-critical path); now an index rewrite is O(rows) whatever the payloads.
-Each row references its blob by name and anchors it with a sha256
-(`ContentSHA256`) — reassembled and **verified** before any byte can
-reach the wire. Copy the index with `cp` whenever you like; the atomic
-rename means a reader always sees the old or the new file, never a torn
-one. Completed jobs are kept as history — the index is the audit log,
-the blobs are the evidence.
+stores in one directory can never destroy each other's payloads),
+holding that job's body and attachments — **while the job can still
+fire**: the persist that records sent/failed also releases the blob,
+keeping the row's sha256 as the permanent fingerprint. The split is the
+fix for the fat-workload trap where every mutation rewrote every byte
+ever stored (a 70MB index cost seconds per write, on the warm window's
+critical path); now an index rewrite is O(rows) whatever the payloads,
+and the blob directory is bounded by the live queue, not by history.
+Each pending row references its blob by name and anchors it with a
+sha256 (`ContentSHA256`) — reassembled and **verified** before any byte
+can reach the wire. Copy the index with `cp` whenever you like; the
+atomic rename means a reader always sees the old or the new file, never
+a torn one. Rows are kept forever — the index is the audit log;
+**conserving the payload originals for legal purposes is the sender's
+responsibility, not gomailer's** (see Housekeeping below).
 
 Sidecar files beside it implement the process discipline: `jobs.json.lock`
 (cross-process write serialization) and `jobs.json.runlock` (the firing
@@ -303,33 +312,49 @@ right); the blobs live in their own store-named sidecar directory,
 `jobs.json.blobs/`. Back them up along with the store or accept that a
 restore needs a daemon restart, which recreates them.
 
-### Housekeeping (optional — and now only about disk, never speed)
+### Housekeeping (optional — the payloads now clean up after themselves)
 
-The index no longer needs trimming: it stays slim forever, whatever the
-payload history. The `jobs.json.blobs/` directory grows by ~1.4× each
-job's payload and is **evidence** — for ricevuta `breve` the stored
-original is what a
-dispute-time digest match verifies against (TODO.md item 3), so do NOT
-delete blobs of jobs whose receipts are digest-based. If you must reclaim
-disk, archive terminal rows together with their blobs (never one without
-the other — a row without its blob can never fire or be verified):
+**Retention policy**: a payload blob lives only while its job can still
+fire. The persist that records `sent`/`failed` also releases the blob
+(see the `RELEASED` log line): the row keeps its sha256 as the permanent
+fingerprint, the bytes are deleted. The `jobs.json.blobs/` directory is
+therefore bounded by the live queue, not by history — no trimming, no
+unbounded growth. Rows are kept forever (the index is the audit log);
+if you want to shrink THAT, the trim recipe below archives terminal
+rows out of the index. Two notes:
+
+- **Conserving the payload originals for legal purposes is the sender's
+  responsibility, not gomailer's.** A ricevuta `breve` binds its hashes
+  to the attachment originals the SENDER must keep (DM 2/11/2005 —
+  "il mittente conservi gli originali immodificati degli allegati");
+  keep your own copy of what you send. `-keep-payloads` restores the
+  keep-forever behavior for the conservative operator.
+- On the first boot after upgrading, gomailer brings pre-existing
+  terminal rows under the policy (`STORE: released N terminal
+  payload(s)` — a one-time eviction, loudly logged). Re-run with
+  `-keep-payloads` first if you would rather archive those old blobs
+  yourself.
 
     sudo systemctl stop gomailer
     cd /var/lib/gomailer
     A=$(date +%F)
     sudo cp jobs.json "archive-$A.json"
     sudo mkdir -p "archive-$A.blobs"
-    for f in $(sudo jq -r '.jobs[] | select(.State=="sent" or .State=="failed") | .ContentFile // empty' "archive-$A.json"); do
+    for f in $(sudo jq -r '.Jobs[] | select(.State=="sent" or .State=="failed") | .ContentFile // empty' "archive-$A.json"); do
         sudo mv "jobs.json.blobs/$f" "archive-$A.blobs/"
     done
-    sudo jq '{version: 2, jobs: [.jobs[] | select(.State=="pending" or .State=="inflight")]}' \
+    sudo jq '{version: 2, jobs: [.Jobs[] | select(.State=="pending" or .State=="inflight")]}' \
         "archive-$A.json" | sudo tee /tmp/trim.json >/dev/null
     sudo install -o gomailer -g gomailer -m 600 /tmp/trim.json jobs.json && rm /tmp/trim.json
     sudo systemctl start gomailer
 
-Pending and inflight rows (and their blobs) must survive any trim — they
-are the live queue. A job whose blob is missing fails terminally at its
-window with `payload source failed …` (never auto-resent).
+(The blob-move loop only moves blobs for rows that still have one —
+settled rows written by release-aware gomailers carry `ContentFile:
+""` and keep only their fingerprint; legacy rows from before the policy
+may still carry files.) Pending and inflight rows (and their blobs) must
+survive any trim — they are the live queue. A pending job whose blob is
+missing fails terminally at its window with `payload source failed …`
+(never auto-resent).window with `payload source failed …` (never auto-resent).
 
 ## 7. Reboots, crashes, and recovery
 
@@ -416,7 +441,8 @@ was down.
 - Store file: mode 0600, contains the mailbox credentials of the jobs
   still waiting to fire (terminal rows are stripped of theirs) —
   restrict the directory, never commit it, back it up like a password
-  file. The `jobs.json.blobs/` payload files are 0600 too (owner-only) —
+  file. The `jobs.json.blobs/` payload files (present while a job can
+  still fire) are 0600 too (owner-only) —
   they are
   legally binding evidence, treat the whole state dir as one unit.
 - Control socket: 0600, owner-only, local machine only; requests carry
@@ -440,7 +466,9 @@ was down.
 | `SCHEDULED` | job persisted and armed (client ack mirrors it); `payload=` names the bytes that will cross the wire — the uplink baseline (TODO.md item 5) |
 | `STORE: split N legacy row(s) …` | one-time boot migration of a pre-split store: payload bytes moved to per-job blobs, the index rewritten slim |
 | `STORE: adopted N blob(s) …` | one-time boot step for stores written by the first split builds: referenced blobs moved from the shared `blobs/` directory into the store's own `jobs.json.blobs/` |
-| `STORE: swept N orphan blob(s) …` | boot removed blob files no row references (crash residue between blob write and row save — pure disk) |
+| `STORE: swept N orphan blob(s) …` | boot removed blob files no row references (crash residue between blob write and row save, or between a release's row write and its file delete — pure disk) |
+| `STORE: released N terminal payload(s) …` | one-time boot step bringing pre-policy terminal rows under the retention policy: their blobs deleted, rows keep the sha256 fingerprint |
+| `STORE: dropped the inline payload of N settled row(s) …` | migration of a pre-split store slimmed settled rows (the inline bytes were the settled jobs' payloads — released by policy, not lost) |
 | `queue: N pending, …` | boot snapshot after recovery |
 | `daemon: accepting submissions on …` | socket is live — health checks turn green |
 | `WARM … session ready in …` | warmup done off the critical path |
@@ -450,6 +478,7 @@ was down.
 | `WARNING … held transaction lost …: cold send at fire time` | the dot never left the wire; exactly one cold full send started at the fire time. The `after …` figure is what the dead held transaction consumed — it lands in the job's recorded `LATE` too, and the following `send=` measures the cold send |
 | `WARNING … FIRED <delay> LATE` | catch-up: no firing process existed at the deadline |
 | `SENT … send=…` | provider accepted the message |
+| `RELEASED …` | the job settled: its payload blob was deleted in the same atomic write that recorded the outcome; the row keeps the sha256 fingerprint. The bytes are now the sender's to conserve, not the store's |
 | `FAILED …` | terminal failure, never auto-retried — read `err=`; an error carrying `delivery dot was written, outcome uncertain` means the send MIGHT have gone out: verify the recipient inbox for the Message-ID (the §7 crash procedure); one carrying `payload source failed` means the blob was missing or corrupt and nothing was sent (§8) |
 | `RECOVER …` | boot found a job interrupted mid-send: manual verification |
 | `SECURITY swept …` | boot found terminal rows still carrying a credential (written by an older gomailer) and blanked it |

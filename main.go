@@ -49,11 +49,12 @@ func main() {
 		pass      = flag.String("pass", os.Getenv("PEC_PASSWORD"), "mailbox password (falls back to $PEC_PASSWORD)")
 		storePath = flag.String("store", "gomailer-jobs.json", "job store (JSON file; survives reboot)")
 
-		at         = flag.String("at", "", `absolute fire time: "2006-01-02 15:04:05", "15:04:05" (today, local), or RFC3339`)
-		in         = flag.String("in", "", `relative fire time: "90s", "5m", "1h30m" (ignored when -at is set)`)
-		minLead    = flag.Duration("min-lead", 0, "minimum scheduling horizon; the future 24/7 service will set 24h")
-		lead       = flag.Duration("lead", 5*time.Second, "warmup window floor: the window opens this long — earlier for fat payloads — before fire; the whole transaction is then staged and its delivery dot held until the fire time; 0 = cold (daemon and resume modes)")
-		maxPayload = flag.Int("max-payload", 70, "per-job payload limit in MB, decimal (body + attachments; the default mirrors the default provider's guaranteed 70 MB attachment bound; 0 disables the check)")
+		at          = flag.String("at", "", `absolute fire time: "2006-01-02 15:04:05", "15:04:05" (today, local), or RFC3339`)
+		in          = flag.String("in", "", `relative fire time: "90s", "5m", "1h30m" (ignored when -at is set)`)
+		minLead     = flag.Duration("min-lead", 0, "minimum scheduling horizon; the future 24/7 service will set 24h")
+		lead        = flag.Duration("lead", 5*time.Second, "warmup window floor: the window opens this long — earlier for fat payloads — before fire; the whole transaction is then staged and its delivery dot held until the fire time; 0 = cold (daemon and resume modes)")
+		maxPayload  = flag.Int("max-payload", 70, "per-job payload limit in MB, decimal (body + attachments; the default mirrors the default provider's guaranteed 70 MB attachment bound; 0 disables the check)")
+		keepPayload = flag.Bool("keep-payloads", false, "retain payload bytes after the job settles (sent/failed); the default releases them once the send's outcome is recorded — conserving the originals for legal purposes is the sender's responsibility, not gomailer's")
 
 		to      = flag.String("to", "", "comma-separated recipient PEC addresses")
 		subject = flag.String("subject", "", "message subject")
@@ -89,6 +90,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("opening store: %v", err)
 	}
+	store.KeepPayloads = *keepPayload
 	scheduler := jobber.NewScheduler(store)
 	scheduler.MinLead = *minLead
 	scheduler.WarmLead = *lead

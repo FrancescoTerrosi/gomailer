@@ -520,7 +520,13 @@ func (s *Scheduler) ScheduleWithID(id string, cfg mailer.MailConfig, content *ma
 	}
 
 	s.mu.Lock()
-	s.pending.Insert(job)
+	// Queue the PERSISTED job — the one carrying its blob reference
+	// (AddNew's created return), not the pre-extract copy: the runner's
+	// terminal persist releases the payload THROUGH that reference (the
+	// row keeps the digest as its fingerprint). Queueing the bare copy
+	// would settle the row without ever releasing — a leaked blob and a
+	// fingerprintless row.
+	s.pending.Insert(existing)
 	s.mu.Unlock()
 	// Always hint the loop, not only for a new head: warm windows are
 	// payload-aware, so a job deep in the queue can carry the EARLIEST
@@ -652,10 +658,20 @@ func (s *Scheduler) run(ctx context.Context, serve bool, ready func()) error {
 		log.Printf("STORE: adopted %d blob(s) from the shared blobs/ directory into %s (the per-store blob layout)",
 			adopted, s.store.blobDir())
 	}
+	// Boot, retention policy: rows settled by older gomailers still
+	// reference their payload blobs (the pre-policy keep-forever
+	// behavior). Bring them under the policy — the row keeps the
+	// sha256 fingerprint; the bytes were the sender's to conserve all
+	// along.
+	if released, err := s.store.ReleaseTerminalPayloads(); err != nil {
+		return fmt.Errorf("jobber: releasing terminal payloads: %w", err)
+	} else if released > 0 {
+		log.Printf("STORE: released %d terminal payload(s) — retention policy: payload bytes live until the job settles; rows keep the sha256 fingerprint", released)
+	}
 	if swept, err := s.store.SweepOrphanBlobs(); err != nil {
 		return fmt.Errorf("jobber: sweeping orphan blobs: %w", err)
 	} else if swept > 0 {
-		log.Printf("STORE: swept %d orphan blob(s) — left behind by a crash mid-scheduling (pure disk, nothing referenced them)", swept)
+		log.Printf("STORE: swept %d orphan blob(s) — crash residue (mid-scheduling, or between a release's row write and its file delete); pure disk, nothing referenced them", swept)
 	}
 
 	// Boot recovery: a job found inflight means the previous process died

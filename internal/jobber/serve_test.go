@@ -323,11 +323,13 @@ func TestServeStopLeavesPendingArmed(t *testing.T) {
 	// One imminent job (handed off and fired) and one far-future job
 	// that must stay untouched when the daemon stops.
 	near := testContent("near")
-	if _, err := s.Schedule(testConfig(), &near, time.Now().Add(150*time.Millisecond)); err != nil {
+	nearJob, err := s.Schedule(testConfig(), &near, time.Now().Add(150*time.Millisecond))
+	if err != nil {
 		t.Fatal(err)
 	}
 	far := testContent("far")
-	if _, err := s.Schedule(testConfig(), &far, time.Now().Add(time.Hour)); err != nil {
+	farJob, err := s.Schedule(testConfig(), &far, time.Now().Add(time.Hour))
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -347,18 +349,34 @@ func TestServeStopLeavesPendingArmed(t *testing.T) {
 	jobs, _ := store.Load()
 	states := map[string]JobState{}
 	for _, j := range jobs {
-		// Slim rows: the body lives in the blob — reassemble before keying.
-		full, err := store.ContentOf(j)
-		if err != nil {
-			t.Fatalf("job %s: hydrating: %v", j.ID, err)
-		}
-		states[string(full.Body)] = j.State
+		states[j.ID] = j.State
 	}
-	if states["near"] != StateSent {
-		t.Fatalf("near job state = %q, want sent", states["near"])
+	if states[nearJob.ID] != StateSent {
+		t.Fatalf("near job state = %q, want sent", states[nearJob.ID])
 	}
-	if states["far"] != StatePending {
-		t.Fatalf("far job state = %q, want pending (re-arms at next start)", states["far"])
+	if states[farJob.ID] != StatePending {
+		t.Fatalf("far job state = %q, want pending (re-arms at next start)", states[farJob.ID])
+	}
+	// The retention policy on the same rows: the settled job RELEASED
+	// its payload (reference gone, fingerprint kept, file deleted); the
+	// pending job keeps its bytes intact and rehydratable.
+	nearRow, ok, err := store.GetByID(nearJob.ID)
+	if err != nil || !ok {
+		t.Fatalf("near row: ok=%v err=%v", ok, err)
+	}
+	if nearRow.ContentFile != "" || nearRow.ContentSHA256 == "" {
+		t.Fatalf("settled row must be released with its fingerprint: file=%q sha=%q", nearRow.ContentFile, nearRow.ContentSHA256)
+	}
+	if _, err := store.ContentOf(nearRow); err == nil || !strings.Contains(err.Error(), "released") {
+		t.Fatalf("ContentOf on a settled row must refuse loudly, got %v", err)
+	}
+	farRow, ok, err := store.GetByID(farJob.ID)
+	if err != nil || !ok || farRow.ContentFile == "" {
+		t.Fatalf("pending row must keep its payload: ok=%v err=%v row=%+v", ok, err, farRow)
+	}
+	full, err := store.ContentOf(farRow)
+	if err != nil || full.Body != "far" {
+		t.Fatalf("pending row payload = %+v err=%v, want the exact bytes", full, err)
 	}
 }
 

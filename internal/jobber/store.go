@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -36,6 +37,9 @@ import (
 // once (at scheduling, or at the one-time boot migration) and never
 // rewritten. Version 1 files still LOAD (rows come back hydrated) and
 // are migrated at boot or by the next write, whichever comes first.
+// Rows settled by the retention policy carry ContentFile == "" with
+// ContentSHA256 != "" — the released shape (see releasePayload): same
+// on-disk format, no version bump.
 const storeVersion = 2
 
 // storeFile is the on-disk envelope. The field names are load-bearing:
@@ -82,18 +86,34 @@ type contentBlob struct {
 }
 
 // Store persists jobs as a slim JSON index plus one write-once blob per
-// job.
+// job — for exactly as long as the job can still fire.
+//
+// RETENTION POLICY (releasePayload): a payload blob lives from
+// scheduling until the job settles. The terminal persist that records
+// sent/failed also releases the blob: the row is saved WITHOUT its
+// reference (keeping the sha256 as the permanent fingerprint of what
+// crossed the wire), then the file is deleted — reference cleared on
+// disk before the bytes go, so a crash in between leaves an
+// unreferenced file for the boot sweep, never a live row without
+// bytes. The ROW is the permanent record (identifiers, Message-ID,
+// timestamps, lateness, send duration, error text); conserving the
+// payload ORIGINALS for legal purposes is the SENDER's duty, not the
+// store's — a ricevuta breve binds its hashes to bytes the sender must
+// keep (DM 2/11/2005: "è indispensabile che il mittente conservi gli
+// originali immodificati degli allegati"). KeepPayloads is the escape
+// hatch restoring the pre-policy keep-forever behavior.
 //
 // Every mutation rewrites the INDEX atomically: content is written to a
 // temp file, fsynced, then renamed over the old file (and the directory
 // entry is fsynced too), so a reboot mid-write can never expose a torn
 // file: a reader sees either the old or the new state, never a half one.
-// A job's blob is written (and fsynced) BEFORE the row that references
-// it is saved, so the only residue a crash can leave between the two is
-// an unreferenced blob — pure disk, swept at boot (SweepOrphanBlobs); a
-// row referencing missing bytes cannot happen, and a blob that fails its
-// recorded sha256 is terminal for the job (ContentOf): a certified
-// sender never puts unverified bytes on the wire.
+// A pending job's blob is written (and fsynced) BEFORE the row that
+// references it is saved, so the only residue a crash can leave between
+// the two is an unreferenced blob — pure disk, swept at boot
+// (SweepOrphanBlobs); a row referencing missing bytes cannot happen,
+// and a blob that fails its recorded sha256 is terminal for the job
+// (ContentOf): a certified sender never puts unverified bytes on the
+// wire.
 //
 // SECURITY: pending jobs carry the mailbox credentials (replayed at fire
 // time), so both the index and the blobs are created with 0600
@@ -105,6 +125,37 @@ type contentBlob struct {
 type Store struct {
 	path string
 	mu   sync.Mutex
+
+	// KeepPayloads is the escape hatch from the retention policy: when
+	// set, payload blobs are retained after the job settles too (the
+	// pre-policy behavior). See releasePayload — the policy seam.
+	KeepPayloads bool
+}
+
+// releasePayload is THE retention-policy seam: whether a job in the
+// given state has its payload blob released at that state's persist.
+//
+// POLICY (2026-09-28, product owner's call): both terminal states
+// release. A settled job never fires again under the current spec —
+// at-most-one-send is absolute, a re-send is a NEW job with a fresh
+// submission — so the bytes are operationally dead the moment the
+// outcome is recorded, and conserving the originals is the sender's
+// duty, not the tool's.
+//
+// SPEC COUPLING — revisit this predicate BEFORE changing
+// at-most-one-send: if a later spec lets FAILED jobs be re-fired
+// (today an interrupted send is marked failed at boot and never
+// re-sent), re-fire of the SAME row needs the bytes, and they are
+// gone. Released rows are self-describing — ContentFile == "" with
+// ContentSHA256 != "" (a shape no other write path produces) — and
+// ContentOf refuses them loudly, so a future re-fire path fails
+// visibly instead of sending empty bytes. Either stop releasing
+// failed rows, or make re-fire require a fresh submission.
+func (s *Store) releasePayload(state JobState) bool {
+	if s.KeepPayloads {
+		return false
+	}
+	return state == StateSent || state == StateFailed
 }
 
 // OpenStore opens (creating if absent) the job store at path.
@@ -227,6 +278,13 @@ func (s *Store) extractLocked(j *Job) error {
 	if j.ContentFile != "" {
 		return nil // already split
 	}
+	if s.releasePayload(j.State) {
+		// Settled row: the payload is released by policy, not split —
+		// persisting it slim (no reference) is the release shape for
+		// rows that never had one (pre-split terminal rows). The bytes
+		// are the sender's to conserve, not the store's.
+		return nil
+	}
 	name, sha, err := s.writeBlobLocked(j.ID, contentBlob{
 		Body:        j.Content.Body,
 		Attachments: j.Content.Attachments,
@@ -338,15 +396,26 @@ func (s *Store) Add(j Job) error {
 }
 
 // Update replaces the job with the same ID, or appends it when absent.
+// Every terminal-state write in the system flows through this one choke
+// point, which makes both terminal invariants mechanical rather than
+// conventional — a future code path cannot forget either:
+//
+//   - the mailbox credential is stripped (a job that will never fire
+//     again has no business remembering one), and
+//   - the payload blob is RELEASED (releasePayload): the row is
+//     persisted without its reference — the sha256 stays as the
+//     permanent fingerprint — and only then is the file deleted.
+//     Rows-before-bytes ordering makes the release crash-safe: a crash
+//     between the row write and the file delete leaves an unreferenced
+//     blob for the boot sweep, never a live row pointing at missing
+//     bytes. A crash BEFORE the row write leaves the job inflight with
+//     its payload intact, and the next boot's recovery settles it.
 func (s *Store) Update(j Job) error {
-	// A terminal job never fires again (never auto-resent; a re-send is
-	// a NEW job with fresh credentials), so its mailbox credential is
-	// dead weight and pure risk: strip it before the row is persisted.
-	// Every terminal-state write in the system flows through this one
-	// choke point, which makes the invariant mechanical rather than
-	// conventional — a future code path cannot forget it. Pending and
-	// inflight rows keep theirs: the firing loop replays them at fire
-	// time.
+	release := ""
+	if j.ContentFile != "" && s.releasePayload(j.State) {
+		release = j.ContentFile
+		j.ContentFile = "" // the digest stays: the row's fingerprint
+	}
 	if j.State == StateSent || j.State == StateFailed {
 		j.Config.Password = ""
 	}
@@ -364,10 +433,36 @@ func (s *Store) Update(j Job) error {
 	for i := range jobs {
 		if jobs[i].ID == j.ID {
 			jobs[i] = j
-			return s.saveLocked(jobs)
+			if err := s.saveLocked(jobs); err != nil {
+				return err
+			}
+			s.removeReleasedBlob(release, j)
+			return nil
 		}
 	}
-	return s.saveLocked(append(jobs, j))
+	if err := s.saveLocked(append(jobs, j)); err != nil {
+		return err
+	}
+	s.removeReleasedBlob(release, j)
+	return nil
+}
+
+// removeReleasedBlob deletes the payload file of a row just persisted
+// without its reference, and says so in the log — the release is an
+// auditable event, never a silent one. Best-effort by design: a failed
+// remove (or a crash before it) leaves an unreferenced file, which the
+// boot sweep collects.
+func (s *Store) removeReleasedBlob(name string, j Job) {
+	if name == "" {
+		return
+	}
+	if err := os.Remove(s.blobPath(name)); err != nil && !os.IsNotExist(err) {
+		log.Printf("RELEASED job=%s msgid=%s: payload file %s could not be removed (%v) — the boot sweep will collect it",
+			j.ID, j.MessageID, name, err)
+		return
+	}
+	log.Printf("RELEASED job=%s msgid=%s payload=%s (state=%s — bytes released at settle; the row keeps the sha256 fingerprint; conserving the originals is the sender's duty, not the store's)",
+		j.ID, j.MessageID, humanBytes(j.PayloadBytes), j.State)
 }
 
 // GetByID returns the job with the given ID, if present.
@@ -435,6 +530,13 @@ func (s *Store) ContentOf(j Job) (mailer.MailContent, error) {
 	// socket submissions and other runners' state writes — jobs sharing
 	// a deadline need their reassemblies to run in PARALLEL.
 	if j.ContentFile == "" {
+		if j.ContentSHA256 != "" {
+			// The released shape: reference cleared at the terminal
+			// persist, digest kept as the fingerprint. No other write
+			// path produces it — and the refusal is loud, so a future
+			// re-fire path fails visibly instead of sending empty bytes.
+			return mailer.MailContent{}, fmt.Errorf("jobber: payload of job %s was released at its terminal state (sha256 %s kept on the row as the fingerprint) — conserving the originals is the sender's duty, not the store's", j.ID, j.ContentSHA256)
+		}
 		return j.Content, nil // inline: fresh in RAM, or a legacy row
 	}
 	raw, err := os.ReadFile(s.blobPath(j.ContentFile))
@@ -477,15 +579,33 @@ func (s *Store) Migrate() ([]Job, int, error) {
 		return nil, 0, err
 	}
 	converted := 0
+	slimmed := 0
 	for i := range jobs {
 		if jobs[i].ContentFile == "" {
+			if s.releasePayload(jobs[i].State) {
+				// Settled row from the pre-split era, payload still
+				// inline: extract declines by policy, so slim it here —
+				// the retention policy for settled jobs, not a loss.
+				// (Pre-split rows carry no fingerprint; the slim half
+				// stays for the audit.) Idempotent: an already-slim row
+				// has nothing to drop.
+				if jobs[i].Content.Body != "" || len(jobs[i].Content.Attachments) > 0 {
+					jobs[i].Content.Body = ""
+					jobs[i].Content.Attachments = nil
+					slimmed++
+				}
+				continue
+			}
 			if err := s.extractLocked(&jobs[i]); err != nil {
 				return nil, 0, err
 			}
 			converted++
 		}
 	}
-	if converted > 0 {
+	if slimmed > 0 {
+		log.Printf("STORE: dropped the inline payload of %d settled row(s) — retention policy: payload bytes live until the job settles", slimmed)
+	}
+	if converted > 0 || slimmed > 0 {
 		if err := s.saveLocked(jobs); err != nil {
 			return nil, 0, err
 		}
@@ -556,13 +676,58 @@ func (s *Store) AdoptLegacyBlobs() (int, error) {
 	return adopted, nil
 }
 
+// ReleaseTerminalPayloads clears the blob references of TERMINAL rows
+// that still carry them — rows settled by gomailers older than the
+// release-at-terminal policy — and deletes the files. The digest stays
+// on each row as its fingerprint. Idempotent: a no-op for stores
+// written entirely by release-aware gomailers (their terminal rows
+// never persist with a reference). Called once at boot by the firing
+// process, after migration and adoption: it is what brings
+// pre-existing history under the retention policy. Gated by
+// KeepPayloads — the escape hatch keeps legacy blobs, too.
+func (s *Store) ReleaseTerminalPayloads() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lk, err := s.lock()
+	if err != nil {
+		return 0, err
+	}
+	defer unlockStore(lk)
+	jobs, err := s.loadLocked()
+	if err != nil {
+		return 0, err
+	}
+	var released []string
+	for i := range jobs {
+		if jobs[i].ContentFile != "" && s.releasePayload(jobs[i].State) {
+			released = append(released, jobs[i].ContentFile)
+			jobs[i].ContentFile = "" // the digest stays: the fingerprint
+		}
+	}
+	if len(released) == 0 {
+		return 0, nil
+	}
+	// Rows first, bytes second (see Update): a crash in between leaves
+	// unreferenced files for the boot sweep.
+	if err := s.saveLocked(jobs); err != nil {
+		return 0, err
+	}
+	for _, name := range released {
+		if err := os.Remove(s.blobPath(name)); err != nil && !os.IsNotExist(err) {
+			log.Printf("RELEASED: legacy payload file %s could not be removed (%v) — the boot sweep will collect it", name, err)
+		}
+	}
+	return len(released), nil
+}
+
 // SweepOrphanBlobs removes blob files no row references — the residue of
 // a crash between a blob write and the row save that would have claimed
-// it (the write order makes an unreferenced blob the only possible crash
-// leftover, and it is pure disk). Called once at boot by the firing
-// process that owns the store. Only this store's OWN directory is read:
-// the pre-namespacing shared directory (legacyBlobDir) is never swept —
-// another store may own files in it (see AdoptLegacyBlobs).
+// it, or between a release's row save and its file delete (the write
+// order makes an unreferenced blob the only possible crash leftover in
+// both directions, and it is pure disk). Called once at boot by the
+// firing process that owns the store. Only this store's OWN directory is
+// read: the pre-namespacing shared directory (legacyBlobDir) is never
+// swept — another store may own files in it (see AdoptLegacyBlobs).
 func (s *Store) SweepOrphanBlobs() (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -674,9 +839,13 @@ func unlockStore(f *os.File) {
 func (s *Store) saveLocked(jobs []Job) error {
 	ordered := slices.Clone(jobs)
 	slices.SortFunc(ordered, jobLess)
-	// The never-drop invariant: a row about to be persisted without a
-	// blob reference gets one now, so no write path can ever slim a row
-	// into evidence loss.
+	// The never-drop invariant: a row that has not yet fired cannot be
+	// persisted without a blob reference — extractLocked writes one for
+	// every unsplit pending/inflight row here, so no write path can drop
+	// the payload of a job that can still fire. Terminal rows are the
+	// one deliberate exception: extract declines them (releasePayload),
+	// and their payload is released by policy at the terminal persist
+	// (Update) — never dropped implicitly, always released explicitly.
 	for i := range ordered {
 		if err := s.extractLocked(&ordered[i]); err != nil {
 			return err
