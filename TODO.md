@@ -388,6 +388,59 @@ holding the terminating dot. The prefire prohibition applies to
   held transaction's cost now lands in the recorded lateness (and the
   WARNING log) instead of vanishing (`TestFallbackStampCarriesTheLostHold`).
 
+**Queue scaling (2026-09-28, decision: leave as is)**: the window-ordered
+slice stays, with its remaining data-structure costs documented here
+rather than optimized away. The workload this project is currently for
+— timing-verified certified sends, one per test window, pending counts
+in the tens — cannot observe any of them:
+
+- **Cost model.** The dispatch pop is a front-delete
+  (`slices.Delete(q,0,1)`) — the one unconditionally worst-position
+  memmove in the system: the whole tail shifts, once per fired job,
+  ~275B per element (payload bytes ride behind slice headers and never
+  move): 0.1–0.3ms at 10⁴ pending, spent inside the warm window 21+ s
+  before the dot. The mid-queue INSERT — a job scheduled 25h out
+  landing behind later jobs, not at the tail — is the only remaining
+  O(N) arrival cost; it moves only what sits BEHIND it, so imminent
+  jobs (in front, by the same key that orders dispatch) are untouched.
+  Typical arrivals land near the tail and move ≈ nothing.
+- **Lock disentanglement (why none of this can delay a fire).** The
+  queue is pure RAM under the SCHEDULER's mutex; reordering it never
+  touches `jobs.json` (its flock is held earlier, inside `AddNew`, for
+  the index read-modify-write + blob fsync — the submitting client's
+  latency). The dot is runner-owned and takes no store lock before the
+  wire; hydrate is lock-free; the terminal persist (with the payload
+  release) is post-dot. The single corridor from queue work to a late
+  fire is a COLD dispatch racing an arrival's critical section — toll
+  = the memmove/fsync duration, honestly recorded as lateness.
+- **Alternatives considered and deferred.** (1) HEAD-INDEX pops (pop =
+  advance an integer, the slice never mutates): O(1) pops for ~30
+  lines and zero policy — deferred only because unobservable at this
+  scale; the first move when the trigger below fires. (2) A
+  window-keyed HEAP: never — it dominates nothing (log-n pops worse
+  than the head-index, worse than buckets at scale, more machinery in
+  between); the deleted `priorityqueue.go` sketch stays deleted. (3)
+  "LOCK-AND-LOAD" BUCKETS — the endgame for ~10⁵–10⁶ pending:
+  double-buffered window buckets, bulk-sorted offline (one O(n log n)
+  sort per bucket, far from any fire instant), head-indexed, and
+  insertion-proof by policy (MinLead ≥ horizon + maxLead, so no
+  arrival can open a window inside a loaded bucket). Its real prize is
+  not the memmove elimination: buckets loaded FROM THE STORE close the
+  fallback-arming gap (persist-only jobs enter the next bucket instead
+  of waiting for a replay or restart). Needs the 24h-MinLead service
+  vision anyway.
+- **Same-deferral note, store side**: `AddNew`'s critical section holds
+  the flock through the blob fsync; a fat arrival can stall another
+  runner's inflight persist by up to one payload fsync (cold sends pay
+  it as lateness; warm ones absorb it in the hold). If measurements
+  ever show it, hoisting the blob write OUT of the lock — write-once,
+  named by job ID, crash-identical (a crash in between leaves an
+  unreferenced blob for the boot sweep) — shrinks the hold to
+  index-only.
+- **TRIGGER to revisit**: sustained pending > ~10⁵, or dispatch-pass
+  contention ever measured above ~10ms. Until then the simple structure
+  IS the right one.
+
 **Still pending before it runs against the certified provider**: the live
 held-dot probe (the item-1 discipline — no wire-behavior change without
 one): stage a probe job against Legalmail, hold ~20s, dot, and verify the

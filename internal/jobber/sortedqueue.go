@@ -13,6 +13,14 @@ import (
 // reboots; this is just the live firing order, and it deliberately does
 // NOT share the store's on-disk fire-time order (jobLess, used by
 // saveLocked to keep the human-audited index sorted by FireAt).
+//
+// COST MODEL (2026-09-28, decision: leave as is — see TODO item 6
+// "Queue scaling"): the dispatch pop (a front-delete in the tender) and
+// mid-queue inserts are O(N) memmoves of ~275B structs — payload bytes
+// ride behind slice headers and never move. Sub-millisecond at ≤10⁴
+// pending, spent inside the warm window, and unreachable from the
+// runner-owned dot. The documented endgame (~10⁵+ pending) is a
+// head-index now and "lock-and-load" buckets then, NOT a heap.
 type SortedQueue []Job
 
 // jobLess orders jobs by FireAt, breaking ties with CreatedAt (FIFO for

@@ -805,7 +805,7 @@ func (s *Scheduler) run(ctx context.Context, serve bool, ready func()) error {
 			j := s.pending[0]
 			lead := s.stagedLead(j)
 			warm := lead > 0 && j.FireAt.Sub(now) >= min(minWarmBudget, lead/2)
-			s.pending = slices.Delete(s.pending, 0, 1)
+			s.pending = slices.Delete(s.pending, 0, 1) // front-delete: O(N) tail shift, deliberate — sub-ms at ≤10⁴ pending; the head-index that would remove it is deferred to the TODO item 6 trigger
 			s.active[j.ID] = struct{}{}
 			go s.runJob(j, warm)
 			dispatched++
