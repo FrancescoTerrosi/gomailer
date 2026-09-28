@@ -60,6 +60,19 @@ type Job struct {
 	Config    mailer.MailConfig
 	State     JobState
 	Result    *JobResult
+
+	// Split-store fields (see store.go): ContentFile names the per-job
+	// blob holding the fat half of the payload (body + attachments);
+	// ContentSHA256 is that blob's sha256; PayloadBytes is the raw
+	// payload size snapshotted at scheduling. In RAM Content stays the
+	// whole payload whenever its holder needs it; on disk the row
+	// carries only the slim half (To/Subject/receipt type inline), so
+	// index rewrites are O(rows), never O(payload) — the fat workload
+	// made whole-file rewrites of a 70MB+ history cost seconds per
+	// mutation, right on the warm-window critical path.
+	ContentFile   string
+	ContentSHA256 string
+	PayloadBytes  int64
 }
 
 // NewJobID returns a short random hex identifier. Clients pre-generate it

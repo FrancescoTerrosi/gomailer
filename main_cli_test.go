@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"testing"
@@ -210,8 +211,27 @@ func TestSubmitJobWithAttachments(t *testing.T) {
 	if err != nil || len(jobs) != 1 {
 		t.Fatalf("store: err=%v jobs=%d, want the submitted job", err, len(jobs))
 	}
-	got := jobs[0].Content.Attachments
+	// Slim row: the attachment bytes live in the job's blob — the
+	// round-trip proof is the reassembled payload.
+	full, err := store.ContentOf(jobs[0])
+	if err != nil {
+		t.Fatalf("reassembling the persisted payload: %v", err)
+	}
+	got := full.Attachments
 	if len(got) != 1 || got[0].Filename != "contratto.pdf" || !bytes.Equal(got[0].Data, pdfData) {
 		t.Fatalf("persisted attachment = %+v, want contratto.pdf with the exact bytes", got)
+	}
+	// And the index stayed slim: the fat bytes never ride the row (they
+	// would appear there base64-encoded — exactly the 71MB-index shape
+	// the split exists to prevent).
+	raw, err := os.ReadFile(filepath.Join(dir, "jobs.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte(base64.StdEncoding.EncodeToString(pdfData))) {
+		t.Fatal("attachment bytes are inline in the store index — the split layout must keep them in the blob")
+	}
+	if fi, err := os.Stat(filepath.Join(dir, "jobs.json.blobs", jobs[0].ContentFile)); err != nil || fi.IsDir() {
+		t.Fatalf("the referenced blob must exist: %v", err)
 	}
 }

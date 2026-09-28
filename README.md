@@ -147,11 +147,19 @@ NTP-synced (`timedatectl`) for meaningful numbers.
 
 ## The store
 
-A single human-readable JSON file (default `gomailer-jobs.json`), mode
+A slim human-readable JSON index (default `gomailer-jobs.json`), mode
 0600 — it contains the mailbox credentials of the jobs still waiting to
-fire (terminal rows are stripped of theirs), so keep it private. Every
-state transition rewrites it atomically (temp file → fsync → rename), and
-completed jobs are kept as history:
+fire (terminal rows are stripped of theirs), so keep it private — plus
+one write-once blob per job under `<store>.blobs/` next to it (a
+directory named after the index, like the `.lock`/`.runlock` sidecars),
+holding that
+job's body and attachments, referenced by name and anchored by a
+sha256 that is verified before any byte can reach the wire. Every state
+transition rewrites the INDEX atomically (temp file → fsync → rename);
+index rewrites are O(rows), never O(payload) — the fat workload made
+whole-file rewrites of an inline-payload history the dominant growing
+latency, so the payload moved out. Completed jobs are kept as history
+(the index is the audit log, the blobs are the evidence):
 
     pending → inflight → sent | failed
 

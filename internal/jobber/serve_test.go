@@ -347,7 +347,12 @@ func TestServeStopLeavesPendingArmed(t *testing.T) {
 	jobs, _ := store.Load()
 	states := map[string]JobState{}
 	for _, j := range jobs {
-		states[string(j.Content.Body)] = j.State
+		// Slim rows: the body lives in the blob — reassemble before keying.
+		full, err := store.ContentOf(j)
+		if err != nil {
+			t.Fatalf("job %s: hydrating: %v", j.ID, err)
+		}
+		states[string(full.Body)] = j.State
 	}
 	if states["near"] != StateSent {
 		t.Fatalf("near job state = %q, want sent", states["near"])

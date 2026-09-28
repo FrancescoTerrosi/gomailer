@@ -380,9 +380,11 @@ func (a *attachList) Set(v string) error {
 // moment it fires. A missing or unreadable file is therefore a
 // scheduling-time error — never a fire-time surprise.
 //
-// NOTE (deferred, see TODO.md): attachment bytes are embedded base64 in
-// the store JSON, and the filename is the one input not bounded for the
-// SMTP line limit at scheduling time.
+// NOTE (deferred, see TODO.md): attachment bytes are persisted once, at
+// scheduling time — since the split store they live in the job's blob
+// (`<store>.blobs/`, beside the index), not inline in the index — and the
+// filename is the one input not bounded for the SMTP line limit at
+// scheduling time.
 func loadAttachments(paths []string) ([]mailer.Attachment, error) {
 	if len(paths) == 0 {
 		return nil, nil

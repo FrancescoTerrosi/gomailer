@@ -82,7 +82,7 @@ store JSON. Consequences to remember:
 scheduling time above N MB (same fail-early seam as item 1) — cheap and
 sufficient for a long time. If blobs ever grow beyond that, move them
 out of the store into content-addressed sidecar files
-(`<store dir>/blobs/<sha256>`), with the job record carrying hash +
+(`<store>.blobs/<sha256>`), with the job record carrying hash +
 length; the `storeVersion` comment in store.go already anticipates the
 SQL-store future where this lands natively.
 
@@ -134,12 +134,39 @@ What remains in this item is only the SQLite endgame.
 **Coupling with receipt type (2026-09-27 note)**: with ricevuta `breve`,
 the consegna attests delivery via headers + DIGEST of the original —
 matching that digest at dispute time requires the original bytes, which
-exist only in the store row (body + attachments, kept as history by
-design). Any store-slimming endgame (blob eviction, SQLite blobs,
-cleanup) must NOT evict payloads of jobs whose receipts are digest-based
-(`breve`), or it silently destroys the verification half of the legal
-chain. Retention policy and receipt-type policy are coupled — decide
-together (see item 5). What today reads as bloat is also evidence.
+exist only in the stored job (body + attachments, kept as history by
+design — in the per-job blob since the split store, anchored by the
+row's `ContentSHA256`). Any store-slimming endgame (blob eviction,
+SQLite blobs, cleanup) must NOT evict payloads of jobs whose receipts
+are digest-based (`breve`), or it silently destroys the verification half
+of the legal chain. Retention policy and receipt-type policy are
+coupled — decide together (see item 5). What today reads as bloat is
+also evidence.
+
+**Shipped (2026-09-27, later still — the split store)**: the fat
+workload turned the whole-file rewrite tax into the dominant GROWING
+latency (a 70MB index: seconds per mutation, serialized under one
+lock, on the warm window's critical path — measured as the
+`SCHEDULED → STAGED` gap eating ~5s of a 30s window, with one job
+staging 105ms before fire). The sidecar sketch above is now the real
+layout: `jobs.json` is a slim index (recipients/subject/receipt type
+inline — the audit log), the fat half (body + attachments) lives in
+ONE write-once blob per job under `<store>.blobs/` (beside the index,
+like the lock sidecars), referenced by
+name and anchored by its sha256; `ContentOf` verifies the digest before
+any byte can reach the wire, and `PayloadBytes` rides the row so
+`stagedLead` sizes windows without the payload in RAM. Version-1 files
+still load and migrate at boot (one blob write per row, ONE slim
+rewrite); the save path carries a never-drop invariant (no write can
+slim a row into evidence loss — the CLI fallback writing into a v1
+file converts it row by row); orphan blobs are swept at boot; and the
+blob directory is named after the store file (`<store>.blobs/`), so
+two stores in one state directory can never sweep each other's
+evidence (a boot step adopts the blobs the first split builds kept
+in a shared `blobs/` sibling). Index
+rewrites are O(rows) forever, whatever the payloads. What remains of
+this item is still only the SQLite endgame — now for queryability and
+concurrent writers, not for performance.
 
 ## 3. Credentials: strip at terminal (shipped) + encrypt at rest (designed, not yet built)
 
@@ -281,7 +308,9 @@ schema change — the field has traveled since protocol 1)**:
   because the real limit is the unknowable sender mailbox quota;
 - payload bytes into the `SCHEDULED` log line — already computed by the
   `-max-payload` admission check; also makes `send=` decomposable into
-  an uplink MB/s baseline.
+  an uplink MB/s baseline. **Shipped with the split store**: `payload=`
+  rides `SCHEDULED`, and the snapshot rides the row (`PayloadBytes`)
+  so window sizing never needs the payload in RAM.
 
 Also measured while at it: `send=9.46s` for that fat job is irreducible
 in-tool — it is bandwidth × (payload × 1.37 base64) + provider-side
@@ -309,8 +338,8 @@ holding the terminating dot. The prefire prohibition applies to
   a sliding per-chunk deadline on the transport (30s), the dot write (30s)
   and the answer read (60s) — all inside TimeoutStopSec=90s.
 - Scheduler (scheduler.go): payload-aware warm windows (`stagedLead`:
-  connect+auth + RCPT round-trips + payload/UplinkRate + HoldBudget, floored
-  at `-lead`); queue-wide dispatch scan (a fat job deep in the queue can
+  connect+auth + RCPT round-trips + payload/UplinkRate + split-row blob
+  reassembly (defaultHydrateRate) + HoldBudget, floored at `-lead`); queue-wide dispatch scan (a fat job deep in the queue can
   carry the earliest window); staging in prewarm; the "just go" fire paths
   (finish-then-dot on overrun, cold full send at the fire time when the dot
   write fails, terminal verify when the dot left). Logged `STAGED upload=…`

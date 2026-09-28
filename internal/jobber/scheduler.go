@@ -150,6 +150,16 @@ const defaultHoldBudget = 20 * time.Second
 // The logged STAGED upload= durations are the data for tightening it.
 const defaultUplinkRate = 2 * 1000 * 1000
 
+// defaultHydrateRate is the assumed payload reassembly throughput
+// (decimal bytes/s) used to budget a split row's hydration inside its
+// warm window: reading its blob, verifying the sha256 and unmarshaling
+// the JSON/base64 costs ~1.4× the payload in bytes (the on-disk form).
+// Real reassembly runs at hundreds of MB/s on commodity hardware (a
+// ~20MB payload reassembles in well under a second); 25 MB/s is an
+// order-of-magnitude conservative floor, so windows grow by seconds,
+// never minutes (see stagedLead).
+const defaultHydrateRate = 25 * 1000 * 1000
+
 // defaultMaxPayload is the per-job payload admission default (body +
 // attachment bytes). It mirrors the default provider's published
 // guarantee — Legalmail certifies delivery only for messages whose
@@ -316,18 +326,35 @@ func NewScheduler(store *Store) *Scheduler {
 // stagedLead sizes one job's warm window: the time its runner needs to
 // open and authenticate a session (connectAuthBudget), run the lock-step
 // envelope (rcptBudget per recipient), stream the payload at the assumed
-// uplink rate, and then hold the dot for HoldBudget before FireAt. Only
-// jobs inside their window are handed off, so a provider session is held
-// no longer than this. WarmLead floors the result (short windows stay
-// as configured); WarmLead 0 means no warmup at all, hence no window.
+// uplink rate, reassemble a split row's payload from its blob
+// (defaultHydrateRate), and then hold the dot for HoldBudget before
+// FireAt. Only jobs inside their window are handed off, so a provider
+// session is held no longer than this. WarmLead floors the result (short
+// windows stay as configured); WarmLead 0 means no warmup at all,
+// hence no window.
 func (s *Scheduler) stagedLead(j Job) time.Duration {
 	if s.WarmLead <= 0 {
 		return 0
 	}
 	est := connectAuthBudget + time.Duration(len(j.Content.To))*rcptBudget
+	// PayloadBytes rides the row (the scheduling-time snapshot), so
+	// the dispatch scan sizes windows over slim rows; hydrated rows
+	// (legacy, pre-migration) fall back to the content at hand.
+	payload := j.PayloadBytes
+	if payload == 0 {
+		payload = payloadBytes(&j.Content)
+	}
 	if s.UplinkRate > 0 {
-		payload := int64(len(j.Content.Body)) + attachmentBytes(j.Content.Attachments)
 		est += time.Duration(payload) * time.Second / time.Duration(s.UplinkRate)
+	}
+	// A split row reassembles its payload from the blob at hand-off —
+	// read + sha256 verify + JSON/base64 unmarshal of ~1.4× the payload —
+	// before the session opens; a runner dispatched at its deadline would
+	// otherwise pay exactly this as lateness. The trigger mirrors
+	// Scheduler.hydrate: a job already holding its content in RAM (a
+	// fresh schedule, a legacy row, a hydrated one) pays nothing here.
+	if j.ContentFile != "" && j.Content.Body == "" {
+		est += time.Duration(payload*14/10) * time.Second / time.Duration(defaultHydrateRate)
 	}
 	lead := est + s.HoldBudget
 	if lead < s.WarmLead {
@@ -450,8 +477,12 @@ func (s *Scheduler) ScheduleWithID(id string, cfg mailer.MailConfig, content *ma
 	// not guarantee delivery above its published attachment bound at
 	// all — a message that big is a scheduling mistake, and it must die
 	// here, never at fire time. Zero or negative disables the check.
+	// The same number rides the row (PayloadBytes — stagedLead sizes
+	// warm windows from it) and the SCHEDULED log (payload=, the
+	// uplink-baseline item TODO.md item 5 asks for).
+	payload := payloadBytes(&c)
 	if s.MaxPayload > 0 {
-		if payload := int64(len(c.Body)) + attachmentBytes(c.Attachments); payload > s.MaxPayload {
+		if payload > s.MaxPayload {
 			return Job{}, fmt.Errorf("jobber: message payload is %s, above the %s per-job limit (-max-payload, in MB; 0 disables it — the default mirrors the provider's guaranteed delivery bound)", humanBytes(payload), humanBytes(s.MaxPayload))
 		}
 	}
@@ -465,13 +496,14 @@ func (s *Scheduler) ScheduleWithID(id string, cfg mailer.MailConfig, content *ma
 	c.MessageID = mid
 
 	job := Job{
-		ID:        id,
-		MessageID: mid,
-		FireAt:    fireAt,
-		CreatedAt: now,
-		Content:   c,
-		Config:    cfg,
-		State:     StatePending,
+		ID:           id,
+		MessageID:    mid,
+		FireAt:       fireAt,
+		CreatedAt:    now,
+		Content:      c,
+		Config:       cfg,
+		State:        StatePending,
+		PayloadBytes: payload,
 	}
 
 	// Persist BEFORE acknowledging the job: a scheduled job must never
@@ -502,10 +534,10 @@ func (s *Scheduler) ScheduleWithID(id string, cfg mailer.MailConfig, content *ma
 	default:
 	}
 
-	log.Printf("SCHEDULED job=%s msgid=%s to=%s fire=%s (in %s)",
+	log.Printf("SCHEDULED job=%s msgid=%s to=%s fire=%s (in %s) payload=%s",
 		job.ID, job.MessageID, strings.Join(c.To, ","),
 		fireAt.Format("2006-01-02 15:04:05.000000 -0700"),
-		fireAt.Sub(now).Round(time.Millisecond))
+		fireAt.Sub(now).Round(time.Millisecond), humanBytes(payload))
 	return job, nil
 }
 
@@ -594,9 +626,36 @@ func (s *Scheduler) run(ctx context.Context, serve bool, ready func()) error {
 	}
 	defer lock.release()
 
-	jobs, err := s.store.Load()
+	// Boot, split-store first: one bounded pass (a blob write per legacy
+	// row, ONE slim index rewrite) converts a version-1 store — after
+	// this, every later mutation rewrites an O(rows) index, never the
+	// payload history (see store.go for why that tax mattered). The
+	// queue is then built from the migrated view.
+	jobs, migrated, err := s.store.Migrate()
 	if err != nil {
 		return fmt.Errorf("jobber: loading store: %w", err)
+	}
+	if migrated > 0 {
+		log.Printf("STORE: split %d legacy row(s) — payload bytes moved to %s; the index stays slim from here on",
+			migrated, s.store.blobDir())
+	}
+	// Boot, blob-layout adoption: the first split-store builds kept every
+	// store's blobs in one shared "blobs" directory beside the index —
+	// two stores in one state directory would have shared it, and either
+	// one's sweep could delete the other's evidence. Blob directories
+	// are now named after their store (see Store.blobDir); this moves
+	// (only) the blobs this store's rows still reference out of the
+	// shared layout.
+	if adopted, err := s.store.AdoptLegacyBlobs(); err != nil {
+		return fmt.Errorf("jobber: adopting the pre-namespacing blob layout: %w", err)
+	} else if adopted > 0 {
+		log.Printf("STORE: adopted %d blob(s) from the shared blobs/ directory into %s (the per-store blob layout)",
+			adopted, s.store.blobDir())
+	}
+	if swept, err := s.store.SweepOrphanBlobs(); err != nil {
+		return fmt.Errorf("jobber: sweeping orphan blobs: %w", err)
+	} else if swept > 0 {
+		log.Printf("STORE: swept %d orphan blob(s) — left behind by a crash mid-scheduling (pure disk, nothing referenced them)", swept)
 	}
 
 	// Boot recovery: a job found inflight means the previous process died
@@ -769,6 +828,19 @@ func (s *Scheduler) runJob(j Job, warm bool) {
 	}()
 
 	st := &warmState{}
+	// Hydrate the payload: rows loaded from the split store carry only
+	// the slim half (a freshly scheduled job, or a legacy row, already
+	// holds the whole content in RAM). The blob's sha256 is verified on
+	// read — a certified sender never puts unverified bytes on the
+	// wire — so a missing or corrupt blob is TERMINAL for the job:
+	// failed with the reason and the reschedule rule, never a blind
+	// re-fire.
+	if err := s.hydrate(&j); err != nil {
+		if ferr := s.failNow(j, "payload source failed: "+err.Error()+"; the job is NOT auto-resent — verify the blobs directory, then schedule a NEW job"); ferr != nil {
+			s.reportFatal(ferr)
+		}
+		return
+	}
 	if warm {
 		if err := s.prewarm(j, st); err != nil {
 			if errors.Is(err, errJobTerminal) {
@@ -796,6 +868,23 @@ func (s *Scheduler) runJob(j Job, warm bool) {
 		s.Courier.Discard(st.session)
 		s.reportFatal(err)
 	}
+}
+
+// hydrate reassembles a job's full payload from its blob when the
+// runner holds only the slim row. The trigger is exact: the body is
+// required non-empty at scheduling, so an empty body means "fat half
+// still in the blob" — and jobs that carry their content inline (fresh
+// schedules, legacy rows) pass through untouched.
+func (s *Scheduler) hydrate(j *Job) error {
+	if j.ContentFile == "" || j.Content.Body != "" {
+		return nil
+	}
+	c, err := s.store.ContentOf(*j)
+	if err != nil {
+		return err
+	}
+	j.Content = c
+	return nil
 }
 
 // sleepUntil blocks until the absolute instant, re-armed in chunks of at
@@ -1060,8 +1149,8 @@ func (s *Scheduler) reportFatal(err error) {
 	}
 }
 
-// attachmentBytes totals the raw bytes of every attachment — the
-// scheduling-time snapshot that must live in the store until the fire
+// attachmentBytes totals the raw bytes of every attachment — half of
+// the scheduling-time snapshot that must live in the store until the fire
 // time and be materialized in RAM when the message is built.
 func attachmentBytes(atts []mailer.Attachment) int64 {
 	var n int64
@@ -1069,6 +1158,14 @@ func attachmentBytes(atts []mailer.Attachment) int64 {
 		n += int64(len(a.Data))
 	}
 	return n
+}
+
+// payloadBytes totals a job's raw payload (body + attachment bytes) —
+// the scheduling-time snapshot that rides the row (Job.PayloadBytes), so
+// the hot loop sizes warm windows (stagedLead) without the payload in
+// RAM, and the SCHEDULED log names what will cross the wire.
+func payloadBytes(c *mailer.MailContent) int64 {
+	return int64(len(c.Body)) + attachmentBytes(c.Attachments)
 }
 
 // humanBytes renders a byte count in decimal units (MB = 10^6), the way

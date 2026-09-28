@@ -252,16 +252,56 @@ recorded lateness, `SEND` the SMTP session length):
     29a729c4633041d2   sent     2026-09-26 16:21:36 +0000  2.01708s  50ms    <0989bc37-...@legalmail.it>
 
 `-list` is read-only and safe at any time, daemon running or not. The store
-is a single human-readable JSON file (mode 0600 — it contains the mailbox
-credentials of the jobs still waiting to fire; terminal rows are stripped
-of theirs): copy it with `cp` whenever you like; the atomic rename means a
-reader always sees the old or the new file, never a torn one. Completed
-jobs are kept as history — the file is also the audit log.
+is a **slim human-readable JSON index** (mode 0600 — it contains the
+mailbox credentials of the jobs still waiting to fire; terminal rows are
+stripped of theirs) plus one **blob file per job** under `jobs.json.blobs/`
+next to it (the blob directory is named after the store file, so two
+stores in one directory can never destroy each other's evidence),
+holding that job's body and attachments — the payload evidence,
+written once at scheduling and never rewritten. The split is the fix for
+the fat-workload trap where every mutation rewrote every byte ever
+stored (a 70MB index cost seconds per write, on the warm window's
+critical path); now an index rewrite is O(rows) whatever the payloads.
+Each row references its blob by name and anchors it with a sha256
+(`ContentSHA256`) — reassembled and **verified** before any byte can
+reach the wire. Copy the index with `cp` whenever you like; the atomic
+rename means a reader always sees the old or the new file, never a torn
+one. Completed jobs are kept as history — the index is the audit log,
+the blobs are the evidence.
 
 Sidecar files beside it implement the process discipline: `jobs.json.lock`
 (cross-process write serialization) and `jobs.json.runlock` (the firing
-right). Back them up along with the store or accept that a restore needs a
-daemon restart, which recreates them.
+right); the blobs live in their own store-named sidecar directory,
+`jobs.json.blobs/`. Back them up along with the store or accept that a
+restore needs a daemon restart, which recreates them.
+
+### Housekeeping (optional — and now only about disk, never speed)
+
+The index no longer needs trimming: it stays slim forever, whatever the
+payload history. The `jobs.json.blobs/` directory grows by ~1.4× each
+job's payload and is **evidence** — for ricevuta `breve` the stored
+original is what a
+dispute-time digest match verifies against (TODO.md item 3), so do NOT
+delete blobs of jobs whose receipts are digest-based. If you must reclaim
+disk, archive terminal rows together with their blobs (never one without
+the other — a row without its blob can never fire or be verified):
+
+    sudo systemctl stop gomailer
+    cd /var/lib/gomailer
+    A=$(date +%F)
+    sudo cp jobs.json "archive-$A.json"
+    sudo mkdir -p "archive-$A.blobs"
+    for f in $(sudo jq -r '.jobs[] | select(.State=="sent" or .State=="failed") | .ContentFile // empty' "archive-$A.json"); do
+        sudo mv "jobs.json.blobs/$f" "archive-$A.blobs/"
+    done
+    sudo jq '{version: 2, jobs: [.jobs[] | select(.State=="pending" or .State=="inflight")]}' \
+        "archive-$A.json" | sudo tee /tmp/trim.json >/dev/null
+    sudo install -o gomailer -g gomailer -m 600 /tmp/trim.json jobs.json && rm /tmp/trim.json
+    sudo systemctl start gomailer
+
+Pending and inflight rows (and their blobs) must survive any trim — they
+are the live queue. A job whose blob is missing fails terminally at its
+window with `payload source failed …` (never auto-resent).
 
 ## 7. Reboots, crashes, and recovery
 
@@ -311,6 +351,7 @@ Fix the cause, schedule again.
 | `systemctl stop` is slow to return | a runner holding a staged dot is committed: it finishes its commit at the fire time, bounded by the warm window plus the per-command read/write deadlines — all sized inside `TimeoutStopSec=90s` | nothing: wait for the drain; a wedged provider now fails the job inside its deadline instead of hanging the stop |
 | Everything fires seconds late | machine clock not NTP-synced | `timedatectl`; lateness is measured against the local clock |
 | `-ping` fine but you expected more pending jobs | wrong store path | `-ping`/`-list`/daemon must share one `-store` |
+| `FAILED … payload source failed … (integrity check / reading content blob)` | the job's blob is missing or failed its sha256 — never sent, never auto-resent | do NOT restore-and-refire blindly: the row is history; verify the blobs dir (disk, backups, a bad trim), then schedule a NEW job |
 
 ## 9. Timing verification
 
@@ -347,7 +388,9 @@ was down.
 - Store file: mode 0600, contains the mailbox credentials of the jobs
   still waiting to fire (terminal rows are stripped of theirs) —
   restrict the directory, never commit it, back it up like a password
-  file.
+  file. The `jobs.json.blobs/` payload files are 0600 too (owner-only) —
+  they are
+  legally binding evidence, treat the whole state dir as one unit.
 - Control socket: 0600, owner-only, local machine only; requests carry
   credentials. Do not loosen the permissions.
 - `/etc/gomailer.env`: mode 600.
@@ -366,7 +409,10 @@ was down.
 
 | Line | Meaning |
 |---|---|
-| `SCHEDULED` | job persisted and armed (client ack mirrors it) |
+| `SCHEDULED` | job persisted and armed (client ack mirrors it); `payload=` names the bytes that will cross the wire — the uplink baseline (TODO.md item 5) |
+| `STORE: split N legacy row(s) …` | one-time boot migration of a pre-split store: payload bytes moved to per-job blobs, the index rewritten slim |
+| `STORE: adopted N blob(s) …` | one-time boot step for stores written by the first split builds: referenced blobs moved from the shared `blobs/` directory into the store's own `jobs.json.blobs/` |
+| `STORE: swept N orphan blob(s) …` | boot removed blob files no row references (crash residue between blob write and row save — pure disk) |
 | `queue: N pending, …` | boot snapshot after recovery |
 | `daemon: accepting submissions on …` | socket is live — health checks turn green |
 | `WARM … session ready in …` | warmup done off the critical path |
@@ -376,7 +422,7 @@ was down.
 | `WARNING … held transaction lost …: cold send at fire time` | the dot never left the wire; exactly one cold full send started at the fire time. The `after …` figure is what the dead held transaction consumed — it lands in the job's recorded `LATE` too, and the following `send=` measures the cold send |
 | `WARNING … FIRED <delay> LATE` | catch-up: no firing process existed at the deadline |
 | `SENT … send=…` | provider accepted the message |
-| `FAILED …` | terminal failure, never auto-retried — read `err=`; an error carrying `delivery dot was written, outcome uncertain` means the send MIGHT have gone out: verify the recipient inbox for the Message-ID (the §7 crash procedure) |
+| `FAILED …` | terminal failure, never auto-retried — read `err=`; an error carrying `delivery dot was written, outcome uncertain` means the send MIGHT have gone out: verify the recipient inbox for the Message-ID (the §7 crash procedure); one carrying `payload source failed` means the blob was missing or corrupt and nothing was sent (§8) |
 | `RECOVER …` | boot found a job interrupted mid-send: manual verification |
 | `SECURITY swept …` | boot found terminal rows still carrying a credential (written by an older gomailer) and blanked it |
 | `CRITICAL … send result could not be persisted` | send happened but the store write failed; next boot flags it |

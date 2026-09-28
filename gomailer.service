@@ -59,8 +59,9 @@ RestartSec=2
 TimeoutStopSec=90s
 
 # --- Sandbox ----------------------------------------------------------------
-# The daemon's entire footprint is the state dir: store, lock sidecars and
-# control socket all live under /var/lib/gomailer (StateDirectory= above),
+# The daemon's entire footprint is the state dir: store, payload blobs,
+# lock sidecars and control socket all live under /var/lib/gomailer
+# (StateDirectory= above),
 # which stays writable under ProtectSystem=strict. Attachment bytes arrive
 # embedded in socket requests and are persisted to the store — the daemon
 # never reads operator files — so a read-only root costs nothing. The wire
